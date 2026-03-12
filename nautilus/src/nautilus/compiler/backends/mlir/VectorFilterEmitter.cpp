@@ -177,6 +177,8 @@ struct EmitContext {
 	std::map<int, ::mlir::Value> colPtrs;
 	// Whether null checks are enabled (only applied for typeSize >= 4)
 	bool nullChecksEnabled;
+	// Pointer to vars[] array (funcOp arg 3), used when isRuntimeVar == true
+	::mlir::Value vars = {};
 };
 
 /// Emit a vector-mode predicate evaluation, returning a vector<Nxi1> mask.
@@ -193,28 +195,56 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 			        b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.elemTy, colPtr, ::mlir::ValueRange {iv});
 			    auto colVec = b.create<::mlir::LLVM::LoadOp>(loc, ctx.vecElemTy, colGep, /*alignment=*/ctx.typeSize);
 
-			    // Splat the constant
-			    ::mlir::DenseElementsAttr splatAttr;
-			    switch (ctx.typeSize) {
-			    case 1:
-				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int8_t>(arg.constantValue));
-				    break;
-			    case 2:
-				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int16_t>(arg.constantValue));
-				    break;
-			    case 4:
-				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int32_t>(arg.constantValue));
-				    break;
-			    case 8:
-				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int64_t>(arg.constantValue));
-				    break;
-			    default:
-				    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for splat");
+			    // Build comparison vector: either from vars[] or compile-time constant
+			    ::mlir::Value splatVec;
+			    if (arg.isRuntimeVar) {
+				    // Load vars[varSlotIndex] as i64, truncate to element type, splat
+				    auto slotIdx = b.create<::mlir::arith::ConstantOp>(loc, b.getI64IntegerAttr(arg.varSlotIndex));
+				    auto varGep = b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.i64Ty, ctx.vars,
+				                                                  ::mlir::ValueRange {slotIdx});
+				    auto varI64 = b.create<::mlir::LLVM::LoadOp>(loc, ctx.i64Ty, varGep, /*alignment=*/8);
+
+				    ::mlir::Value scalar;
+				    if (ctx.typeSize == 8) {
+					    scalar = varI64;
+				    } else {
+					    scalar = b.create<::mlir::arith::TruncIOp>(loc, ctx.elemTy, varI64);
+				    }
+				    splatVec = b.create<::mlir::LLVM::ShuffleVectorOp>(
+				        loc,
+				        b.create<::mlir::LLVM::InsertElementOp>(loc, b.create<::mlir::LLVM::UndefOp>(loc, ctx.vecElemTy),
+				                                                scalar,
+				                                                b.create<::mlir::arith::ConstantOp>(loc, b.getI32IntegerAttr(0))),
+				        b.create<::mlir::LLVM::UndefOp>(loc, ctx.vecElemTy),
+				        llvm::SmallVector<int32_t>(ctx.vectorWidth, 0));
+			    } else {
+				    // Existing path: splat compile-time constant
+				    ::mlir::DenseElementsAttr splatAttr;
+				    switch (ctx.typeSize) {
+				    case 1:
+					    splatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int8_t>(arg.constantValue));
+					    break;
+				    case 2:
+					    splatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int16_t>(arg.constantValue));
+					    break;
+				    case 4:
+					    splatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int32_t>(arg.constantValue));
+					    break;
+				    case 8:
+					    splatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int64_t>(arg.constantValue));
+					    break;
+				    default:
+					    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for splat");
+				    }
+				    splatVec = b.create<::mlir::arith::ConstantOp>(loc, splatAttr);
 			    }
-			    auto splatCst = b.create<::mlir::arith::ConstantOp>(loc, splatAttr);
 
 			    auto pred = comparatorToMLIR(arg.comparator);
-			    auto rawMask = b.create<::mlir::arith::CmpIOp>(loc, pred, colVec, splatCst).getResult();
+			    auto rawMask = b.create<::mlir::arith::CmpIOp>(loc, pred, colVec, splatVec).getResult();
 
 			    // Apply null correction when null checks are enabled and typeSize >= 4
 			    if (ctx.nullChecksEnabled && ctx.typeSize >= 4) {
@@ -230,11 +260,10 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 				    }
 				    auto nullSplat = b.create<::mlir::arith::ConstantOp>(loc, nullSplatAttr);
 
-				    // Check which elements are null
 				    auto lhsNull =
 				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, colVec, nullSplat);
 				    auto rhsNull =
-				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, splatCst, nullSplat);
+				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, splatVec, nullSplat);
 
 				    auto maskType = ::mlir::cast<::mlir::VectorType>(rawMask.getType());
 				    auto trueSplat =
@@ -244,7 +273,6 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 				    switch (arg.comparator) {
 				    case Comp::GT:
 				    case Comp::LT: {
-					    // False if either null: result AND NOT(lhs_null OR rhs_null)
 					    auto eitherNull = b.create<::mlir::arith::OrIOp>(loc, lhsNull, rhsNull);
 					    auto notNull = b.create<::mlir::arith::XOrIOp>(loc, eitherNull, trueSplat);
 					    rawMask = b.create<::mlir::arith::AndIOp>(loc, rawMask, notNull);
@@ -252,11 +280,9 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 				    }
 				    case Comp::GE:
 				    case Comp::LE: {
-					    // True if both null, false if only one null:
-					    // NOT(opposite) AND NOT(lhs_null XOR rhs_null)
 					    auto oppositePred = (arg.comparator == Comp::GE) ? ::mlir::arith::CmpIPredicate::slt
 					                                                     : ::mlir::arith::CmpIPredicate::sgt;
-					    auto oppositeResult = b.create<::mlir::arith::CmpIOp>(loc, oppositePred, colVec, splatCst);
+					    auto oppositeResult = b.create<::mlir::arith::CmpIOp>(loc, oppositePred, colVec, splatVec);
 					    auto notOpposite = b.create<::mlir::arith::XOrIOp>(loc, oppositeResult, trueSplat);
 					    auto nullXor = b.create<::mlir::arith::XOrIOp>(loc, lhsNull, rhsNull);
 					    auto notNullXor = b.create<::mlir::arith::XOrIOp>(loc, nullXor, trueSplat);
@@ -264,15 +290,13 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 					    break;
 				    }
 				    case Comp::EQ: {
-					    // True if both null: (lhs == rhs) OR (lhs_null AND rhs_null)
 					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
 					    rawMask = b.create<::mlir::arith::OrIOp>(loc, rawMask, bothNull);
 					    break;
 				    }
 				    case Comp::NE: {
-					    // NOT(eq with null handling)
 					    auto eqRaw =
-					        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, colVec, splatCst);
+					        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, colVec, splatVec);
 					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
 					    auto eqWithNull = b.create<::mlir::arith::OrIOp>(loc, eqRaw, bothNull);
 					    rawMask = b.create<::mlir::arith::XOrIOp>(loc, eqWithNull, trueSplat);
