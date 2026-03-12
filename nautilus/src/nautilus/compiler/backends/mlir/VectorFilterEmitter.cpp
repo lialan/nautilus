@@ -347,27 +347,39 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 			    auto gep = b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.elemTy, colPtr, ::mlir::ValueRange {jv});
 			    auto val = b.create<::mlir::LLVM::LoadOp>(loc, ctx.elemTy, gep, /*alignment=*/ctx.typeSize);
 
-			    // Create scalar constant matching the element type
+			    // Build scalar comparison value
 			    ::mlir::Value scalarCst;
-			    switch (ctx.typeSize) {
-			    case 1:
-				    scalarCst =
-				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI8Type(), arg.constantValue));
-				    break;
-			    case 2:
-				    scalarCst =
-				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI16Type(), arg.constantValue));
-				    break;
-			    case 4:
-				    scalarCst =
-				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI32Type(), arg.constantValue));
-				    break;
-			    case 8:
-				    scalarCst =
-				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI64Type(), arg.constantValue));
-				    break;
-			    default:
-				    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for scalar constant");
+			    if (arg.isRuntimeVar) {
+				    auto slotIdx = b.create<::mlir::arith::ConstantOp>(loc, b.getI64IntegerAttr(arg.varSlotIndex));
+				    auto varGep = b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.i64Ty, ctx.vars,
+				                                                  ::mlir::ValueRange {slotIdx});
+				    auto varI64 = b.create<::mlir::LLVM::LoadOp>(loc, ctx.i64Ty, varGep, /*alignment=*/8);
+				    if (ctx.typeSize == 8) {
+					    scalarCst = varI64;
+				    } else {
+					    scalarCst = b.create<::mlir::arith::TruncIOp>(loc, ctx.elemTy, varI64);
+				    }
+			    } else {
+				    switch (ctx.typeSize) {
+				    case 1:
+					    scalarCst = b.create<::mlir::arith::ConstantOp>(loc,
+					                                                     b.getIntegerAttr(b.getI8Type(), arg.constantValue));
+					    break;
+				    case 2:
+					    scalarCst = b.create<::mlir::arith::ConstantOp>(
+					        loc, b.getIntegerAttr(b.getI16Type(), arg.constantValue));
+					    break;
+				    case 4:
+					    scalarCst = b.create<::mlir::arith::ConstantOp>(
+					        loc, b.getIntegerAttr(b.getI32Type(), arg.constantValue));
+					    break;
+				    case 8:
+					    scalarCst = b.create<::mlir::arith::ConstantOp>(
+					        loc, b.getIntegerAttr(b.getI64Type(), arg.constantValue));
+					    break;
+				    default:
+					    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for scalar constant");
+				    }
 			    }
 
 			    auto pred = comparatorToMLIR(arg.comparator);
