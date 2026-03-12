@@ -410,6 +410,141 @@ static CompiledFilter buildAndCompilePredicateTree(const nmlir::PredicateNode& r
 	return compileModule(module);
 }
 
+TEST_CASE("VectorFilterEmitter: column type sizes", "[vector-filter-emitter]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	SECTION("i64: col == 42L (vectorWidth=8, exact multiple 256 rows)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/8);
+
+		constexpr int64_t NUM_ROWS = 256;
+		std::vector<int64_t> column(NUM_ROWS, 0);
+		column[0] = 42;
+		column[7] = 42;   // last element of first vector iteration
+		column[8] = 42;   // first element of second vector iteration
+		column[255] = 42; // last element
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 4);
+		CHECK(rowsBuf[0] == 0);
+		CHECK(rowsBuf[1] == 7);
+		CHECK(rowsBuf[2] == 8);
+		CHECK(rowsBuf[3] == 255);
+	}
+
+	SECTION("i64: col == 42L (200 rows, exercises scalar tail)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/8);
+
+		// 200 rows: 200 / 8 = 25 vector iterations, 0 tail (exact)
+		// Use 205 rows to force a scalar tail of 5
+		constexpr int64_t NUM_ROWS = 205;
+		std::vector<int64_t> column(NUM_ROWS, 0);
+		column[42] = 42;
+		column[200] = 42; // in scalar tail (row 200..204)
+		column[204] = 42; // last row, scalar tail
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 3);
+		CHECK(rowsBuf[0] == 42);
+		CHECK(rowsBuf[1] == 200);
+		CHECK(rowsBuf[2] == 204);
+	}
+
+	SECTION("i16: col == 42 (vectorWidth=32, exact multiple 256 rows)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/2);
+
+		constexpr int64_t NUM_ROWS = 256;
+		std::vector<int16_t> column(NUM_ROWS, 0);
+		column[0] = 42;
+		column[31] = 42;  // last element of first vector iteration
+		column[32] = 42;  // first element of second vector iteration
+		column[255] = 42; // last element
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 4);
+		CHECK(rowsBuf[0] == 0);
+		CHECK(rowsBuf[1] == 31);
+		CHECK(rowsBuf[2] == 32);
+		CHECK(rowsBuf[3] == 255);
+	}
+
+	SECTION("i16: col == 42 (200 rows, exercises scalar tail)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/2);
+
+		// 200 rows: 200 / 32 = 6 vector iterations (192 rows), 8 scalar tail
+		constexpr int64_t NUM_ROWS = 200;
+		std::vector<int16_t> column(NUM_ROWS, 0);
+		column[42] = 42;
+		column[192] = 42; // first element of scalar tail
+		column[199] = 42; // last element of scalar tail
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 3);
+		CHECK(rowsBuf[0] == 42);
+		CHECK(rowsBuf[1] == 192);
+		CHECK(rowsBuf[2] == 199);
+	}
+
+	SECTION("i8: col == 42 (vectorWidth=64, exact multiple 256 rows)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/1);
+
+		constexpr int64_t NUM_ROWS = 256;
+		std::vector<int8_t> column(NUM_ROWS, 0);
+		column[0] = 42;
+		column[63] = 42;  // last element of first vector iteration
+		column[64] = 42;  // first element of second vector iteration
+		column[255] = 42; // last element
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 4);
+		CHECK(rowsBuf[0] == 0);
+		CHECK(rowsBuf[1] == 63);
+		CHECK(rowsBuf[2] == 64);
+		CHECK(rowsBuf[3] == 255);
+	}
+
+	SECTION("i8: col == 42 (200 rows, exercises scalar tail)") {
+		auto compiled = buildAndCompileEqFilter(42, /*typeSize=*/1);
+
+		// 200 rows: 200 / 64 = 3 vector iterations (192 rows), 8 scalar tail
+		constexpr int64_t NUM_ROWS = 200;
+		std::vector<int8_t> column(NUM_ROWS, 0);
+		column[42] = 42;
+		column[192] = 42; // first element of scalar tail
+		column[199] = 42; // last element of scalar tail
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 3);
+		CHECK(rowsBuf[0] == 42);
+		CHECK(rowsBuf[1] == 192);
+		CHECK(rowsBuf[2] == 199);
+	}
+}
+
 TEST_CASE("VectorFilterEmitter: compound predicates", "[vector-filter-emitter]") {
 	llvm::InitializeNativeTarget();
 	llvm::InitializeNativeTargetAsmPrinter();
