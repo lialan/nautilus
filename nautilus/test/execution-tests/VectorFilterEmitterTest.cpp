@@ -383,3 +383,138 @@ TEST_CASE("VectorFilterEmitter: comparison operators i32", "[vector-filter-emitt
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Helper: build and compile a VectorFilterEmitter module from a predicate tree.
+// ---------------------------------------------------------------------------
+static CompiledFilter buildAndCompilePredicateTree(const nmlir::PredicateNode& root, int typeSize = 4) {
+	::mlir::DialectRegistry registry;
+	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+	registry.insert<::mlir::scf::SCFDialect>();
+	::mlir::func::registerAllExtensions(registry);
+	::mlir::registerBuiltinDialectTranslation(registry);
+	::mlir::registerLLVMDialectTranslation(registry);
+	::mlir::LLVM::registerInlinerInterface(registry);
+
+	::mlir::MLIRContext context(registry);
+	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	nautilus::engine::Options options;
+	options.setOption("vectorFilter.enabled", true);
+	options.setOption("vectorFilter.typeSize", typeSize);
+	nmlir::VectorFilterEmitter emitter(context, options);
+
+	auto module = emitter.generateModuleFromPredicateTree(root);
+	return compileModule(module);
+}
+
+TEST_CASE("VectorFilterEmitter: compound predicates", "[vector-filter-emitter]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	// Array: [0, 1, 2, ..., 255]
+	constexpr int64_t NUM_ROWS = 256;
+	std::vector<int32_t> column(NUM_ROWS);
+	for (int32_t i = 0; i < NUM_ROWS; i++) {
+		column[i] = i;
+	}
+
+	SECTION("col > 10 AND col < 20") {
+		// expect 9 matches: 11..19
+		auto andNode = std::make_unique<nmlir::AndNode>();
+		andNode->left = nmlir::CompareNode {ir::CompareOperation::GT, 10, 0};
+		andNode->right = nmlir::CompareNode {ir::CompareOperation::LT, 20, 0};
+		nmlir::PredicateNode root = std::move(andNode);
+
+		auto compiled = buildAndCompilePredicateTree(root);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 9);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == 11 + i);
+		}
+	}
+
+	SECTION("col < 5 OR col > 250") {
+		// expect 10 matches: 0..4, 251..255
+		auto orNode = std::make_unique<nmlir::OrNode>();
+		orNode->left = nmlir::CompareNode {ir::CompareOperation::LT, 5, 0};
+		orNode->right = nmlir::CompareNode {ir::CompareOperation::GT, 250, 0};
+		nmlir::PredicateNode root = std::move(orNode);
+
+		auto compiled = buildAndCompilePredicateTree(root);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 10);
+		// First 5: indices 0..4
+		for (int64_t i = 0; i < 5; i++) {
+			CHECK(rowsBuf[i] == i);
+		}
+		// Last 5: indices 251..255
+		for (int64_t i = 0; i < 5; i++) {
+			CHECK(rowsBuf[5 + i] == 251 + i);
+		}
+	}
+
+	SECTION("NOT (col == 42)") {
+		// expect 255 matches
+		auto notNode = std::make_unique<nmlir::NotNode>();
+		notNode->child = nmlir::CompareNode {ir::CompareOperation::EQ, 42, 0};
+		nmlir::PredicateNode root = std::move(notNode);
+
+		auto compiled = buildAndCompilePredicateTree(root);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 255);
+		int64_t expected = 0;
+		for (int64_t i = 0; i < matchCount; i++) {
+			if (expected == 42)
+				expected++;
+			CHECK(rowsBuf[i] == expected);
+			expected++;
+		}
+	}
+
+	SECTION("col1 > 10 AND col2 < 100 (multi-column)") {
+		// Setup two columns, same type i32
+		// col1: [0, 1, 2, ..., 255]   (same as column above)
+		// col2: [255, 254, ..., 0]     (reversed)
+		// col1 > 10 means indices 11..255  (245 rows)
+		// col2 < 100 means col2[i] < 100, i.e. 255-i < 100, i.e. i > 155, so indices 156..255 (100 rows)
+		// AND: indices that satisfy both = 156..255 (100 rows)
+		std::vector<int32_t> col2(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			col2[i] = static_cast<int32_t>(NUM_ROWS - 1 - i);
+		}
+
+		auto andNode = std::make_unique<nmlir::AndNode>();
+		andNode->left = nmlir::CompareNode {ir::CompareOperation::GT, 10, 0};
+		andNode->right = nmlir::CompareNode {ir::CompareOperation::LT, 100, 1};
+		nmlir::PredicateNode root = std::move(andNode);
+
+		auto compiled = buildAndCompilePredicateTree(root);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t cols[2] = {reinterpret_cast<int64_t>(column.data()), reinterpret_cast<int64_t>(col2.data())};
+		int64_t matchCount = compiled.fn(cols, 2, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 100);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == 156 + i);
+		}
+	}
+}

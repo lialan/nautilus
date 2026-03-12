@@ -5,11 +5,14 @@
 #include "nautilus/compiler/ir/operations/FunctionOperation.hpp"
 #include "nautilus/compiler/ir/operations/LoadOperation.hpp"
 #include "nautilus/compiler/ir/operations/LogicalOperations/CompareOperation.hpp"
+#include <algorithm>
+#include <map>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMTypes.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
 #include <mlir/IR/Builders.h>
+#include <set>
 #include <stdexcept>
 
 namespace nautilus::compiler::mlir {
@@ -19,6 +22,29 @@ VectorFilterEmitter::VectorFilterEmitter(::mlir::MLIRContext& context, const eng
 }
 
 VectorFilterEmitter::~VectorFilterEmitter() = default;
+
+// ---------------------------------------------------------------------------
+// Utility: collect all unique column indices from a predicate tree
+// ---------------------------------------------------------------------------
+
+void collectColumnIndices(const PredicateNode& node, std::vector<int>& indices) {
+	std::visit(
+	    [&](auto&& arg) {
+		    using T = std::decay_t<decltype(arg)>;
+		    if constexpr (std::is_same_v<T, CompareNode>) {
+			    indices.push_back(arg.columnIndex);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
+			    collectColumnIndices(arg->left, indices);
+			    collectColumnIndices(arg->right, indices);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<OrNode>>) {
+			    collectColumnIndices(arg->left, indices);
+			    collectColumnIndices(arg->right, indices);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<NotNode>>) {
+			    collectColumnIndices(arg->child, indices);
+		    }
+	    },
+	    node);
+}
 
 // ---------------------------------------------------------------------------
 // IR Walking: Extract predicate from the traced IRGraph
@@ -126,6 +152,158 @@ static ::mlir::arith::CmpIPredicate comparatorToMLIR(ir::CompareOperation::Compa
 ::mlir::OwningOpRef<::mlir::ModuleOp>
 VectorFilterEmitter::generateModuleFromPredicate(ir::CompareOperation::Comparator comparator, int64_t constantValue,
                                                  int columnIndex) {
+	// Wrap as a single CompareNode and delegate to the predicate tree method.
+	CompareNode node {comparator, constantValue, columnIndex};
+	PredicateNode root = node;
+	return generateModuleFromPredicateTree(root);
+}
+
+// ---------------------------------------------------------------------------
+// Helper structures for predicate tree emission context
+// ---------------------------------------------------------------------------
+
+/// Context passed through recursive predicate emission, containing all the
+/// state needed to emit vector and scalar predicate evaluations.
+struct EmitContext {
+	int typeSize;
+	int vectorWidth;
+	::mlir::Type elemTy;
+	::mlir::VectorType vecElemTy;
+	::mlir::Type ptrTy;
+	::mlir::Type i64Ty;
+	// Column pointers indexed by column index
+	std::map<int, ::mlir::Value> colPtrs;
+};
+
+/// Emit a vector-mode predicate evaluation, returning a vector<Nxi1> mask.
+static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location loc, const PredicateNode& node,
+                                         const EmitContext& ctx, ::mlir::Value iv) {
+	return std::visit(
+	    [&](auto&& arg) -> ::mlir::Value {
+		    using T = std::decay_t<decltype(arg)>;
+
+		    if constexpr (std::is_same_v<T, CompareNode>) {
+			    // Load vector from column[iv]
+			    auto colPtr = ctx.colPtrs.at(arg.columnIndex);
+			    auto colGep =
+			        b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.elemTy, colPtr, ::mlir::ValueRange {iv});
+			    auto colVec = b.create<::mlir::LLVM::LoadOp>(loc, ctx.vecElemTy, colGep, /*alignment=*/ctx.typeSize);
+
+			    // Splat the constant
+			    ::mlir::DenseElementsAttr splatAttr;
+			    switch (ctx.typeSize) {
+			    case 1:
+				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int8_t>(arg.constantValue));
+				    break;
+			    case 2:
+				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int16_t>(arg.constantValue));
+				    break;
+			    case 4:
+				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int32_t>(arg.constantValue));
+				    break;
+			    case 8:
+				    splatAttr = ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int64_t>(arg.constantValue));
+				    break;
+			    default:
+				    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for splat");
+			    }
+			    auto splatCst = b.create<::mlir::arith::ConstantOp>(loc, splatAttr);
+
+			    auto pred = comparatorToMLIR(arg.comparator);
+			    return b.create<::mlir::arith::CmpIOp>(loc, pred, colVec, splatCst).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
+			    auto leftMask = emitVectorPredicate(b, loc, arg->left, ctx, iv);
+			    auto rightMask = emitVectorPredicate(b, loc, arg->right, ctx, iv);
+			    return b.create<::mlir::arith::AndIOp>(loc, leftMask, rightMask).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<OrNode>>) {
+			    auto leftMask = emitVectorPredicate(b, loc, arg->left, ctx, iv);
+			    auto rightMask = emitVectorPredicate(b, loc, arg->right, ctx, iv);
+			    return b.create<::mlir::arith::OrIOp>(loc, leftMask, rightMask).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<NotNode>>) {
+			    auto childMask = emitVectorPredicate(b, loc, arg->child, ctx, iv);
+			    // XOR with all-true splat to negate
+			    auto maskType = ::mlir::cast<::mlir::VectorType>(childMask.getType());
+			    auto trueSplat =
+			        b.create<::mlir::arith::ConstantOp>(loc, ::mlir::DenseElementsAttr::get(maskType, true));
+			    return b.create<::mlir::arith::XOrIOp>(loc, childMask, trueSplat).getResult();
+
+		    } else {
+			    throw std::runtime_error("VectorFilterEmitter: unknown predicate node type");
+		    }
+	    },
+	    node);
+}
+
+/// Emit a scalar-mode predicate evaluation, returning an i1 value.
+static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location loc, const PredicateNode& node,
+                                         const EmitContext& ctx, ::mlir::Value jv) {
+	return std::visit(
+	    [&](auto&& arg) -> ::mlir::Value {
+		    using T = std::decay_t<decltype(arg)>;
+
+		    if constexpr (std::is_same_v<T, CompareNode>) {
+			    // Load single element from column[jv]
+			    auto colPtr = ctx.colPtrs.at(arg.columnIndex);
+			    auto gep = b.create<::mlir::LLVM::GEPOp>(loc, ctx.ptrTy, ctx.elemTy, colPtr, ::mlir::ValueRange {jv});
+			    auto val = b.create<::mlir::LLVM::LoadOp>(loc, ctx.elemTy, gep, /*alignment=*/ctx.typeSize);
+
+			    // Create scalar constant matching the element type
+			    ::mlir::Value scalarCst;
+			    switch (ctx.typeSize) {
+			    case 1:
+				    scalarCst =
+				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI8Type(), arg.constantValue));
+				    break;
+			    case 2:
+				    scalarCst =
+				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI16Type(), arg.constantValue));
+				    break;
+			    case 4:
+				    scalarCst =
+				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI32Type(), arg.constantValue));
+				    break;
+			    case 8:
+				    scalarCst =
+				        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI64Type(), arg.constantValue));
+				    break;
+			    default:
+				    throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for scalar constant");
+			    }
+
+			    auto pred = comparatorToMLIR(arg.comparator);
+			    return b.create<::mlir::arith::CmpIOp>(loc, pred, val, scalarCst).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
+			    auto leftVal = emitScalarPredicate(b, loc, arg->left, ctx, jv);
+			    auto rightVal = emitScalarPredicate(b, loc, arg->right, ctx, jv);
+			    return b.create<::mlir::arith::AndIOp>(loc, leftVal, rightVal).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<OrNode>>) {
+			    auto leftVal = emitScalarPredicate(b, loc, arg->left, ctx, jv);
+			    auto rightVal = emitScalarPredicate(b, loc, arg->right, ctx, jv);
+			    return b.create<::mlir::arith::OrIOp>(loc, leftVal, rightVal).getResult();
+
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<NotNode>>) {
+			    auto childVal = emitScalarPredicate(b, loc, arg->child, ctx, jv);
+			    // XOR with true to negate
+			    auto trueVal = b.create<::mlir::arith::ConstantOp>(loc, b.getBoolAttr(true));
+			    return b.create<::mlir::arith::XOrIOp>(loc, childVal, trueVal).getResult();
+
+		    } else {
+			    throw std::runtime_error("VectorFilterEmitter: unknown predicate node type");
+		    }
+	    },
+	    node);
+}
+
+// ---------------------------------------------------------------------------
+// MLIR Generation: Build a vectorized filter module from a predicate tree
+// ---------------------------------------------------------------------------
+
+::mlir::OwningOpRef<::mlir::ModuleOp> VectorFilterEmitter::generateModuleFromPredicateTree(const PredicateNode& root) {
 	context.loadAllAvailableDialects();
 
 	::mlir::OpBuilder builder(&context);
@@ -179,11 +357,29 @@ VectorFilterEmitter::generateModuleFromPredicate(ir::CompareOperation::Comparato
 	::mlir::Value rowsCount = funcOp.getArgument(6);
 	::mlir::Value rowsStartOffset = funcOp.getArgument(7);
 
-	// --- Load column pointer: cols[columnIndex] → inttoptr ---
-	auto colIdxCst = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(columnIndex));
-	auto colGep = builder.create<::mlir::LLVM::GEPOp>(loc, ptrTy, i64Ty, cols, ::mlir::ValueRange {colIdxCst});
-	auto colAddr = builder.create<::mlir::LLVM::LoadOp>(loc, i64Ty, colGep, /*alignment=*/8);
-	auto colPtr = builder.create<::mlir::LLVM::IntToPtrOp>(loc, ptrTy, colAddr, ::mlir::LLVM::DereferenceableAttr());
+	// --- Collect unique column indices and load all column pointers ---
+	std::vector<int> allIndices;
+	collectColumnIndices(root, allIndices);
+	std::set<int> uniqueIndicesSet(allIndices.begin(), allIndices.end());
+	std::map<int, ::mlir::Value> colPtrs;
+	for (int colIdx : uniqueIndicesSet) {
+		auto colIdxCst = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(colIdx));
+		auto colGep = builder.create<::mlir::LLVM::GEPOp>(loc, ptrTy, i64Ty, cols, ::mlir::ValueRange {colIdxCst});
+		auto colAddr = builder.create<::mlir::LLVM::LoadOp>(loc, i64Ty, colGep, /*alignment=*/8);
+		auto colPtr =
+		    builder.create<::mlir::LLVM::IntToPtrOp>(loc, ptrTy, colAddr, ::mlir::LLVM::DereferenceableAttr());
+		colPtrs[colIdx] = colPtr;
+	}
+
+	// --- Build emission context ---
+	EmitContext ctx;
+	ctx.typeSize = typeSize;
+	ctx.vectorWidth = vectorWidth;
+	ctx.elemTy = elemTy;
+	ctx.vecElemTy = vecElemTy;
+	ctx.ptrTy = ptrTy;
+	ctx.i64Ty = i64Ty;
+	ctx.colPtrs = colPtrs;
 
 	// --- Constants ---
 	auto cst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
@@ -194,30 +390,7 @@ VectorFilterEmitter::generateModuleFromPredicate(ir::CompareOperation::Comparato
 	auto remainder = builder.create<::mlir::arith::RemSIOp>(loc, rowsCount, cstVecWidth);
 	auto vecLimit = builder.create<::mlir::arith::SubIOp>(loc, rowsCount, remainder);
 
-	// Splat constant for vector comparison
-	::mlir::DenseElementsAttr splatAttr;
-	switch (typeSize) {
-	case 1:
-		splatAttr = ::mlir::DenseElementsAttr::get(vecElemTy, static_cast<int8_t>(constantValue));
-		break;
-	case 2:
-		splatAttr = ::mlir::DenseElementsAttr::get(vecElemTy, static_cast<int16_t>(constantValue));
-		break;
-	case 4:
-		splatAttr = ::mlir::DenseElementsAttr::get(vecElemTy, static_cast<int32_t>(constantValue));
-		break;
-	case 8:
-		splatAttr = ::mlir::DenseElementsAttr::get(vecElemTy, static_cast<int64_t>(constantValue));
-		break;
-	default:
-		throw std::runtime_error("VectorFilterEmitter: unsupported typeSize for splat");
-	}
-	auto splatCst = builder.create<::mlir::arith::ConstantOp>(loc, splatAttr);
-
-	auto mlirPredicate = comparatorToMLIR(comparator);
-
 	// Number of 8-element groups for compress-store processing.
-	// Each group processes 8 mask bits → 8 row IDs (i64).
 	int numGroups = vectorWidth / 8;
 	if (numGroups < 1) {
 		numGroups = 1;
@@ -230,12 +403,8 @@ VectorFilterEmitter::generateModuleFromPredicate(ir::CompareOperation::Comparato
 	    [&](::mlir::OpBuilder& b, ::mlir::Location bodyLoc, ::mlir::Value iv, ::mlir::ValueRange iterArgs) {
 		    ::mlir::Value outIdx = iterArgs[0];
 
-		    // GEP to column[iv] and load vector
-		    auto colGepInner = b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, elemTy, colPtr, ::mlir::ValueRange {iv});
-		    auto colVec = b.create<::mlir::LLVM::LoadOp>(bodyLoc, vecElemTy, colGepInner, /*alignment=*/typeSize);
-
-		    // Compare: mask = (colVec <pred> splat<constant>)
-		    auto maskFull = b.create<::mlir::arith::CmpIOp>(bodyLoc, mlirPredicate, colVec, splatCst);
+		    // Recursively emit the predicate tree to get the full mask
+		    auto maskFull = emitVectorPredicate(b, bodyLoc, root, ctx, iv);
 
 		    // Row ID base = iv + rowsStartOffset
 		    auto rowBase = b.create<::mlir::arith::AddIOp>(bodyLoc, iv, rowsStartOffset);
@@ -281,40 +450,14 @@ VectorFilterEmitter::generateModuleFromPredicate(ir::CompareOperation::Comparato
 	::mlir::Value vecOut = vecLoop.getResult(0);
 
 	// ============================ Scalar tail loop ============================
-	// Scalar constant for comparison (element-sized)
 	auto scalarLoop = builder.create<::mlir::scf::ForOp>(
 	    loc, /*lb=*/vecLimit.getResult(), /*ub=*/rowsCount, /*step=*/cst1.getResult(),
 	    /*iterArgs=*/::mlir::ValueRange {vecOut},
 	    [&](::mlir::OpBuilder& b, ::mlir::Location bodyLoc, ::mlir::Value jv, ::mlir::ValueRange iterArgs) {
 		    ::mlir::Value tidx = iterArgs[0];
 
-		    // Load single element from column[jv]
-		    auto gep = b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, elemTy, colPtr, ::mlir::ValueRange {jv});
-		    auto val = b.create<::mlir::LLVM::LoadOp>(bodyLoc, elemTy, gep, /*alignment=*/typeSize);
-
-		    // Create scalar constant matching the element type
-		    ::mlir::Value scalarCst;
-		    switch (typeSize) {
-		    case 1:
-			    scalarCst =
-			        b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getIntegerAttr(b.getI8Type(), constantValue));
-			    break;
-		    case 2:
-			    scalarCst =
-			        b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getIntegerAttr(b.getI16Type(), constantValue));
-			    break;
-		    case 4:
-			    scalarCst =
-			        b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getIntegerAttr(b.getI32Type(), constantValue));
-			    break;
-		    case 8:
-			    scalarCst =
-			        b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getIntegerAttr(b.getI64Type(), constantValue));
-			    break;
-		    }
-
-		    // Compare
-		    auto match = b.create<::mlir::arith::CmpIOp>(bodyLoc, mlirPredicate, val, scalarCst);
+		    // Recursively emit the scalar predicate
+		    auto match = emitScalarPredicate(b, bodyLoc, root, ctx, jv);
 
 		    // Compute row ID = jv + rowsStartOffset
 		    auto rowId = b.create<::mlir::arith::AddIOp>(bodyLoc, jv, rowsStartOffset);
