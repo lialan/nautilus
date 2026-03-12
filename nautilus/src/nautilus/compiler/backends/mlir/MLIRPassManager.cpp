@@ -45,7 +45,7 @@ int MLIRPassManager::lowerAndOptimizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp
 		passManager.addPass(mlir::createInlinerPass());
 	}
 	// Apply lowering passes.
-	passManager.addPass(mlir::createConvertSCFToCFPass());
+	passManager.addPass(mlir::createSCFToControlFlowPass());
 	passManager.addPass(mlir::createConvertMathToLLVMPass());
 	passManager.addPass(mlir::createConvertFuncToLLVMPass());
 	passManager.addPass(mlir::createConvertControlFlowToLLVMPass());
