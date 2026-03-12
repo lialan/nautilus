@@ -22,6 +22,8 @@ struct CompareNode {
 	ir::CompareOperation::Comparator comparator;
 	int64_t constantValue;
 	int columnIndex;
+	int varSlotIndex = -1;
+	bool isRuntimeVar = false;
 };
 
 struct AndNode;
