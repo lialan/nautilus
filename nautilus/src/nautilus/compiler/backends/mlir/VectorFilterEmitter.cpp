@@ -734,4 +734,224 @@ VectorFilterEmitter::generateModuleFromIR(const std::shared_ptr<ir::IRGraph>& ir
 	return generateModuleFromPredicate(predicate.comparator, predicate.constantValue, predicate.columnIndex);
 }
 
+// ---------------------------------------------------------------------------
+// Serialization: PredicateNode tree <-> compact binary format
+// ---------------------------------------------------------------------------
+
+namespace {
+
+enum NodeType : uint8_t { NT_COMPARE = 0, NT_AND = 1, NT_OR = 2, NT_NOT = 3 };
+
+enum ComparatorWire : uint8_t { CW_EQ = 0, CW_NE = 1, CW_LT = 2, CW_LE = 3, CW_GT = 4, CW_GE = 5 };
+
+ComparatorWire comparatorToWire(ir::CompareOperation::Comparator c) {
+	switch (c) {
+	case ir::CompareOperation::EQ:
+		return CW_EQ;
+	case ir::CompareOperation::NE:
+		return CW_NE;
+	case ir::CompareOperation::LT:
+		return CW_LT;
+	case ir::CompareOperation::LE:
+		return CW_LE;
+	case ir::CompareOperation::GT:
+		return CW_GT;
+	case ir::CompareOperation::GE:
+		return CW_GE;
+	default:
+		throw std::runtime_error("serializePredicateTree: unsupported comparator");
+	}
+}
+
+ir::CompareOperation::Comparator wireToComparator(uint8_t w) {
+	switch (w) {
+	case CW_EQ:
+		return ir::CompareOperation::EQ;
+	case CW_NE:
+		return ir::CompareOperation::NE;
+	case CW_LT:
+		return ir::CompareOperation::LT;
+	case CW_LE:
+		return ir::CompareOperation::LE;
+	case CW_GT:
+		return ir::CompareOperation::GT;
+	case CW_GE:
+		return ir::CompareOperation::GE;
+	default:
+		throw std::runtime_error("deserializePredicateTree: invalid comparator wire value");
+	}
+}
+
+struct WireNode {
+	uint8_t nodeType;
+	uint8_t comparator;
+	int16_t columnIndex;
+	int32_t childA;
+	int32_t childB;
+	int32_t reserved;
+};
+
+static_assert(sizeof(WireNode) == 16);
+
+int flattenNode(const PredicateNode& node, std::vector<WireNode>& nodes) {
+	return std::visit(
+	    [&](auto&& arg) -> int {
+		    using T = std::decay_t<decltype(arg)>;
+		    if constexpr (std::is_same_v<T, CompareNode>) {
+			    WireNode wn {};
+			    wn.nodeType = NT_COMPARE;
+			    wn.comparator = comparatorToWire(arg.comparator);
+			    wn.columnIndex = static_cast<int16_t>(arg.columnIndex);
+			    wn.childA = arg.varSlotIndex;
+			    wn.childB = -1;
+			    wn.reserved = 0;
+			    nodes.push_back(wn);
+			    return static_cast<int>(nodes.size() - 1);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
+			    int leftIdx = flattenNode(arg->left, nodes);
+			    int rightIdx = flattenNode(arg->right, nodes);
+			    WireNode wn {};
+			    wn.nodeType = NT_AND;
+			    wn.childA = leftIdx;
+			    wn.childB = rightIdx;
+			    nodes.push_back(wn);
+			    return static_cast<int>(nodes.size() - 1);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<OrNode>>) {
+			    int leftIdx = flattenNode(arg->left, nodes);
+			    int rightIdx = flattenNode(arg->right, nodes);
+			    WireNode wn {};
+			    wn.nodeType = NT_OR;
+			    wn.childA = leftIdx;
+			    wn.childB = rightIdx;
+			    nodes.push_back(wn);
+			    return static_cast<int>(nodes.size() - 1);
+		    } else if constexpr (std::is_same_v<T, std::unique_ptr<NotNode>>) {
+			    int childIdx = flattenNode(arg->child, nodes);
+			    WireNode wn {};
+			    wn.nodeType = NT_NOT;
+			    wn.childA = childIdx;
+			    wn.childB = -1;
+			    nodes.push_back(wn);
+			    return static_cast<int>(nodes.size() - 1);
+		    } else {
+			    throw std::runtime_error("flattenNode: unknown node type");
+		    }
+	    },
+	    node);
+}
+
+void validateWireNodes(const std::vector<WireNode>& nodes) {
+	int n = static_cast<int>(nodes.size());
+	for (int i = 0; i < n; i++) {
+		const auto& wn = nodes[i];
+		switch (wn.nodeType) {
+		case NT_COMPARE:
+			if (wn.childB != -1) {
+				throw std::runtime_error("deserializePredicateTree: Compare node must have childB == -1");
+			}
+			break;
+		case NT_AND:
+		case NT_OR:
+			if (wn.childA < 0 || wn.childA >= n || wn.childB < 0 || wn.childB >= n) {
+				throw std::runtime_error("deserializePredicateTree: child index out of bounds");
+			}
+			if (wn.childA >= i || wn.childB >= i) {
+				throw std::runtime_error("deserializePredicateTree: child index must precede parent (acyclic)");
+			}
+			break;
+		case NT_NOT:
+			if (wn.childB != -1) {
+				throw std::runtime_error("deserializePredicateTree: Not node must have childB == -1");
+			}
+			if (wn.childA < 0 || wn.childA >= n) {
+				throw std::runtime_error("deserializePredicateTree: child index out of bounds");
+			}
+			if (wn.childA >= i) {
+				throw std::runtime_error("deserializePredicateTree: child index must precede parent (acyclic)");
+			}
+			break;
+		default:
+			throw std::runtime_error("deserializePredicateTree: invalid node type");
+		}
+	}
+}
+
+PredicateNode unflattenNode(const std::vector<WireNode>& nodes, int index) {
+	const auto& wn = nodes[index];
+	switch (wn.nodeType) {
+	case NT_COMPARE: {
+		CompareNode cn;
+		cn.comparator = wireToComparator(wn.comparator);
+		cn.constantValue = 0;
+		cn.columnIndex = wn.columnIndex;
+		cn.varSlotIndex = wn.childA;
+		cn.isRuntimeVar = true;
+		return cn;
+	}
+	case NT_AND: {
+		auto left = unflattenNode(nodes, wn.childA);
+		auto right = unflattenNode(nodes, wn.childB);
+		return std::make_unique<AndNode>(AndNode {std::move(left), std::move(right)});
+	}
+	case NT_OR: {
+		auto left = unflattenNode(nodes, wn.childA);
+		auto right = unflattenNode(nodes, wn.childB);
+		return std::make_unique<OrNode>(OrNode {std::move(left), std::move(right)});
+	}
+	case NT_NOT: {
+		auto child = unflattenNode(nodes, wn.childA);
+		return std::make_unique<NotNode>(NotNode {std::move(child)});
+	}
+	default:
+		throw std::runtime_error("deserializePredicateTree: invalid node type");
+	}
+}
+
+} // anonymous namespace
+
+std::string serializePredicateTree(const PredicateNode& root) {
+	std::vector<WireNode> nodes;
+	int rootIndex = flattenNode(root, nodes);
+
+	uint32_t nodeCount = static_cast<uint32_t>(nodes.size());
+	uint32_t rootIdx = static_cast<uint32_t>(rootIndex);
+
+	std::string data;
+	data.resize(8 + nodeCount * 16);
+	std::memcpy(data.data(), &nodeCount, 4);
+	std::memcpy(data.data() + 4, &rootIdx, 4);
+	for (uint32_t i = 0; i < nodeCount; i++) {
+		std::memcpy(data.data() + 8 + i * 16, &nodes[i], 16);
+	}
+	return data;
+}
+
+PredicateNode deserializePredicateTree(const std::string& data) {
+	if (data.size() < 8) {
+		throw std::runtime_error("deserializePredicateTree: data too small for header");
+	}
+	uint32_t nodeCount = 0;
+	uint32_t rootIndex = 0;
+	std::memcpy(&nodeCount, data.data(), 4);
+	std::memcpy(&rootIndex, data.data() + 4, 4);
+
+	if (nodeCount == 0) {
+		throw std::runtime_error("deserializePredicateTree: nodeCount is 0");
+	}
+	if (rootIndex >= nodeCount) {
+		throw std::runtime_error("deserializePredicateTree: rootIndex out of bounds");
+	}
+	if (data.size() != 8 + nodeCount * 16) {
+		throw std::runtime_error("deserializePredicateTree: data size mismatch");
+	}
+
+	std::vector<WireNode> nodes(nodeCount);
+	for (uint32_t i = 0; i < nodeCount; i++) {
+		std::memcpy(&nodes[i], data.data() + 8 + i * 16, 16);
+	}
+
+	validateWireNodes(nodes);
+	return unflattenNode(nodes, static_cast<int>(rootIndex));
+}
+
 } // namespace nautilus::compiler::mlir

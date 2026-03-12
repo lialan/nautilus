@@ -73,4 +73,10 @@ private:
 /// Collect all unique column indices referenced by a predicate tree.
 void collectColumnIndices(const PredicateNode& node, std::vector<int>& indices);
 
+/// Serialize a PredicateNode tree to compact binary format for Options transport.
+std::string serializePredicateTree(const PredicateNode& root);
+
+/// Deserialize a PredicateNode tree from binary data stored in Options.
+PredicateNode deserializePredicateTree(const std::string& data);
+
 } // namespace nautilus::compiler::mlir
