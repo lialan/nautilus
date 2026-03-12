@@ -81,9 +81,10 @@ static CompiledFilter compileModule(::mlir::OwningOpRef<::mlir::ModuleOp>& modul
 }
 
 // ---------------------------------------------------------------------------
-// Helper: build and compile a VectorFilterEmitter module for i32 eq filter.
+// Helper: build and compile a VectorFilterEmitter module for an i32 filter.
 // ---------------------------------------------------------------------------
-static CompiledFilter buildAndCompileEqFilter(int64_t constantValue, int typeSize = 4) {
+static CompiledFilter buildAndCompileFilter(ir::CompareOperation::Comparator comparator, int64_t constantValue,
+                                            int typeSize = 4) {
 	::mlir::DialectRegistry registry;
 	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
 	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
@@ -102,8 +103,12 @@ static CompiledFilter buildAndCompileEqFilter(int64_t constantValue, int typeSiz
 	options.setOption("vectorFilter.typeSize", typeSize);
 	nmlir::VectorFilterEmitter emitter(context, options);
 
-	auto module = emitter.generateModuleFromPredicate(ir::CompareOperation::EQ, constantValue, /*columnIndex=*/0);
+	auto module = emitter.generateModuleFromPredicate(comparator, constantValue, /*columnIndex=*/0);
 	return compileModule(module);
+}
+
+static CompiledFilter buildAndCompileEqFilter(int64_t constantValue, int typeSize = 4) {
+	return buildAndCompileFilter(ir::CompareOperation::EQ, constantValue, typeSize);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,4 +311,75 @@ TEST_CASE("VectorFilterEmitter: matches spanning vector and scalar regions", "[v
 	CHECK(rowsBuf[3] == 31);
 	CHECK(rowsBuf[4] == 32);
 	CHECK(rowsBuf[5] == 34);
+}
+
+TEST_CASE("VectorFilterEmitter: comparison operators i32", "[vector-filter-emitter]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	// Array: [0, 1, 2, ..., 255] (256 elements)
+	constexpr int64_t NUM_ROWS = 256;
+	std::vector<int32_t> column(NUM_ROWS);
+	for (int32_t i = 0; i < NUM_ROWS; i++) {
+		column[i] = i;
+	}
+
+	SECTION("gt: col > 200") {
+		// expect 55 matches: 201..255
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::GT, 200);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+		CHECK(matchCount == 55);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == 201 + i);
+		}
+	}
+
+	SECTION("lt: col < 10") {
+		// expect 10 matches: 0..9
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::LT, 10);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+		CHECK(matchCount == 10);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == i);
+		}
+	}
+
+	SECTION("ge: col >= 200") {
+		// expect 56 matches: 200..255
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::GE, 200);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+		CHECK(matchCount == 56);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == 200 + i);
+		}
+	}
+
+	SECTION("le: col <= 10") {
+		// expect 11 matches: 0..10
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::LE, 10);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+		CHECK(matchCount == 11);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == i);
+		}
+	}
+
+	SECTION("ne: col != 42") {
+		// expect 255 matches: everything except index 42
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::NE, 42);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+		CHECK(matchCount == 255);
+		int64_t expected = 0;
+		for (int64_t i = 0; i < matchCount; i++) {
+			if (expected == 42)
+				expected++;
+			CHECK(rowsBuf[i] == expected);
+			expected++;
+		}
+	}
 }
