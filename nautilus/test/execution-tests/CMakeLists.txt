@@ -13,6 +13,7 @@ add_executable(nautilus-execution-tests
         BitIntrinsicExecutionTest.cpp
         MemoryIntrinsicExecutionTest.cpp
         VectorFilterSpikeTest.cpp
+        VectorFilterEmitterTest.cpp
 )
 
 nautilus_inline(nautilus-execution-tests)
