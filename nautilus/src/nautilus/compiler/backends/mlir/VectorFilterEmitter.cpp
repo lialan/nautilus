@@ -730,6 +730,14 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 
 ::mlir::OwningOpRef<::mlir::ModuleOp>
 VectorFilterEmitter::generateModuleFromIR(const std::shared_ptr<ir::IRGraph>& ir) {
+	// Check for serialized predicate data from direct wiring path
+	auto predicateData = options.getOptionOrDefault("vectorFilter.predicateData", std::string(""));
+	if (!predicateData.empty()) {
+		auto root = deserializePredicateTree(predicateData);
+		return generateModuleFromPredicateTree(root);
+	}
+
+	// Fallback: extract predicate from traced IR (unit-test path)
 	auto predicate = extractPredicate(*ir);
 	return generateModuleFromPredicate(predicate.comparator, predicate.constantValue, predicate.columnIndex);
 }
