@@ -6,6 +6,7 @@
 #include "nautilus/compiler/backends/mlir/MLIRExecutable.hpp"
 #include "nautilus/compiler/backends/mlir/MLIRLoweringProvider.hpp"
 #include "nautilus/compiler/backends/mlir/MLIRPassManager.hpp"
+#include "nautilus/compiler/backends/mlir/VectorFilterEmitter.hpp"
 #include "nautilus/compiler/backends/mlir/intrinsics/MLIRAssumeIntrinsics.hpp"
 #include "nautilus/compiler/backends/mlir/intrinsics/MLIRBackendIntrinsic.hpp"
 #include "nautilus/compiler/backends/mlir/intrinsics/MLIRBitIntrinsics.hpp"
@@ -60,17 +61,30 @@ std::unique_ptr<Executable> MLIRCompilationBackend::compile(const std::shared_pt
 		context.disableMultithreading();
 	}
 
-	// Register all intrinsics in the intrinsic manager
-	MLIRIntrinsicManager intrinsicManager;
-	if (options.getOptionOrDefault("mlir.enableIntrinsics", true)) {
-		MLIRIntrinsicPluginRegistry::instance().registerAllIntrinsics(intrinsicManager);
+	std::vector<std::string> jitProxySymbols;
+	std::vector<void*> jitProxyAddresses;
+	::mlir::OwningOpRef<::mlir::ModuleOp> mlirModule;
+
+	if (options.getOptionOrDefault("vectorFilter.enabled", false)) {
+		auto vectorEmitter = std::make_unique<VectorFilterEmitter>(context, options);
+		mlirModule = vectorEmitter->generateModuleFromIR(ir);
+		jitProxySymbols = {};
+		jitProxyAddresses = {};
+	} else {
+		// Register all intrinsics in the intrinsic manager
+		MLIRIntrinsicManager intrinsicManager;
+		if (options.getOptionOrDefault("mlir.enableIntrinsics", true)) {
+			MLIRIntrinsicPluginRegistry::instance().registerAllIntrinsics(intrinsicManager);
+		}
+		auto loweringProvider = std::make_unique<MLIRLoweringProvider>(context, options, intrinsicManager);
+		mlirModule = loweringProvider->generateModuleFromIR(ir);
+		jitProxySymbols = loweringProvider->getJitProxyFunctionSymbols();
+		jitProxyAddresses = loweringProvider->getJitProxyTargetAddresses();
 	}
 
-	auto loweringProvider = std::make_unique<MLIRLoweringProvider>(context, options, intrinsicManager);
-	auto mlirModule = loweringProvider->generateModuleFromIR(ir);
 	if (*mlirModule == nullptr) {
 		throw RuntimeException("verification of MLIR module failed!");
-	};
+	}
 
 	// 2.a dump MLIR to console or a file
 	dumpHandler.dump("after_mlir_generation", "mlir", [&]() {
@@ -92,8 +106,7 @@ std::unique_ptr<Executable> MLIRCompilationBackend::compile(const std::shared_pt
 
 	// 4. JIT compile LLVM IR module and return engine that provides access
 	// compiled execute function.
-	auto engine = JITCompiler::jitCompileModule(mlirModule, optPipeline, loweringProvider->getJitProxyFunctionSymbols(),
-	                                            loweringProvider->getJitProxyTargetAddresses(), options);
+	auto engine = JITCompiler::jitCompileModule(mlirModule, optPipeline, jitProxySymbols, jitProxyAddresses, options);
 	if (options.getOptionOrDefault("mlir.eager_compilation", false)) {
 		auto result = engine->lookupPacked("execute");
 		if (!result) {

@@ -28,6 +28,7 @@ if (ENABLE_MLIR_BACKEND)
     
     add_subdirectory(intrinsics)    
     add_source_files(nautilus
+            VectorFilterEmitter.cpp
             MLIRLoweringProvider.cpp
             MLIRCompilationBackend.cpp
             MLIRExecutable.cpp
