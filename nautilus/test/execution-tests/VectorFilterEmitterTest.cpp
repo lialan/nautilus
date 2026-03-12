@@ -98,6 +98,7 @@ static CompiledFilter buildAndCompileEqFilter(int64_t constantValue, int typeSiz
 	context.loadAllAvailableDialects();
 
 	nautilus::engine::Options options;
+	options.setOption("vectorFilter.enabled", true);
 	options.setOption("vectorFilter.typeSize", typeSize);
 	nmlir::VectorFilterEmitter emitter(context, options);
 
