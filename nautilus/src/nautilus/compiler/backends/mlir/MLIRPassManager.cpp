@@ -7,6 +7,7 @@
 #include <mlir/Conversion/FuncToLLVM/ConvertFuncToLLVMPass.h>
 #include <mlir/Conversion/MathToLLVM/MathToLLVM.h>
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
+#include <mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h>
 #include <mlir/ExecutionEngine/OptUtils.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
@@ -44,6 +45,7 @@ int MLIRPassManager::lowerAndOptimizeMLIRModule(mlir::OwningOpRef<mlir::ModuleOp
 		passManager.addPass(mlir::createInlinerPass());
 	}
 	// Apply lowering passes.
+	passManager.addPass(mlir::createConvertSCFToCFPass());
 	passManager.addPass(mlir::createConvertMathToLLVMPass());
 	passManager.addPass(mlir::createConvertFuncToLLVMPass());
 	passManager.addPass(mlir::createConvertControlFlowToLLVMPass());
