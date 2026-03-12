@@ -653,3 +653,354 @@ TEST_CASE("VectorFilterEmitter: compound predicates", "[vector-filter-emitter]")
 		}
 	}
 }
+
+// ===========================================================================
+// Null check helpers and tests
+// ===========================================================================
+
+/// INT_NULL sentinel for i32 columns (QuestDB convention: Integer.MIN_VALUE)
+static constexpr int32_t INT_NULL = static_cast<int32_t>(0x80000000);
+/// LONG_NULL sentinel for i64 columns (QuestDB convention: Long.MIN_VALUE)
+static constexpr int64_t LONG_NULL = static_cast<int64_t>(0x8000000000000000LL);
+
+// ---------------------------------------------------------------------------
+// Helper: build and compile a VectorFilterEmitter with null checks enabled.
+// ---------------------------------------------------------------------------
+static CompiledFilter buildAndCompileFilterWithNullChecks(ir::CompareOperation::Comparator comparator,
+                                                          int64_t constantValue, int typeSize = 4) {
+	::mlir::DialectRegistry registry;
+	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+	registry.insert<::mlir::scf::SCFDialect>();
+	::mlir::func::registerAllExtensions(registry);
+	::mlir::registerBuiltinDialectTranslation(registry);
+	::mlir::registerLLVMDialectTranslation(registry);
+	::mlir::LLVM::registerInlinerInterface(registry);
+
+	::mlir::MLIRContext context(registry);
+	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	nautilus::engine::Options options;
+	options.setOption("vectorFilter.enabled", true);
+	options.setOption("vectorFilter.typeSize", typeSize);
+	options.setOption("mlir.null_checks", true);
+	nmlir::VectorFilterEmitter emitter(context, options);
+
+	auto module = emitter.generateModuleFromPredicate(comparator, constantValue, /*columnIndex=*/0);
+	return compileModule(module);
+}
+
+TEST_CASE("VectorFilterEmitter: null checks i32", "[vector-filter-emitter][null-checks]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	// 256 rows: values 1..256, with INT_NULL injected at specific positions
+	constexpr int64_t NUM_ROWS = 256;
+
+	SECTION("gt with nulls: false if either null") {
+		// col > 10, with INT_NULL at rows 5 and 200
+		// Row 200 would normally match (200 > 10) but null check excludes it
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+		column[200] = INT_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::GT, 10, 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		// Normally 245 rows match (11..255). Row 5 has INT_NULL (already < 10 anyway).
+		// Row 200 has INT_NULL -> excluded by null check -> 244 matches.
+		CHECK(matchCount == 244);
+		// Verify row 200 is not in results
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] != 200);
+		}
+	}
+
+	SECTION("lt with nulls: false if either null") {
+		// col < 10, col[5] = INT_NULL -> row 5 should NOT match
+		// Note: Without null checks, INT_NULL (-2147483648) < 10 is true, so row 5 WOULD match!
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::LT, 10, 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		// Without null checks: rows 0..9 match (10 rows), plus row 5=INT_NULL < 10 -> already in range
+		// With null checks: rows 0..9 except row 5 -> 9 matches
+		CHECK(matchCount == 9);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] != 5);
+		}
+	}
+
+	SECTION("ge with nulls: true if both null") {
+		// col >= INT_NULL, col[5] = INT_NULL -> row 5 SHOULD match (both-null)
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+
+		auto compiled =
+		    buildAndCompileFilterWithNullChecks(ir::CompareOperation::GE, static_cast<int64_t>(INT_NULL), 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		// With null checks: row 5 has INT_NULL, constant is INT_NULL -> both null -> match.
+		// All other rows: lhs is not null, rhs is null -> only-one-null -> false.
+		// So only row 5 matches.
+		CHECK(matchCount == 1);
+		CHECK(rowsBuf[0] == 5);
+	}
+
+	SECTION("le with nulls: true if both null, false if only one null") {
+		// col <= INT_NULL, col[5] = INT_NULL -> row 5 SHOULD match (both-null)
+		// Other rows have normal values >= 0, which are > INT_NULL normally,
+		// but with null checks, rhs is null, so only-one-null -> false.
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+
+		auto compiled =
+		    buildAndCompileFilterWithNullChecks(ir::CompareOperation::LE, static_cast<int64_t>(INT_NULL), 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		// Only row 5 (both null) should match
+		CHECK(matchCount == 1);
+		CHECK(rowsBuf[0] == 5);
+	}
+
+	SECTION("eq with nulls: both-null matches") {
+		// col == INT_NULL, col[5] = INT_NULL -> row 5 SHOULD match
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+
+		auto compiled =
+		    buildAndCompileFilterWithNullChecks(ir::CompareOperation::EQ, static_cast<int64_t>(INT_NULL), 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		CHECK(matchCount == 1);
+		CHECK(rowsBuf[0] == 5);
+	}
+
+	SECTION("ne with nulls: NOT(eq with null handling)") {
+		// col != INT_NULL, col[5] = INT_NULL -> row 5 should NOT match (both-null -> eq=true -> ne=false)
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = INT_NULL;
+
+		auto compiled =
+		    buildAndCompileFilterWithNullChecks(ir::CompareOperation::NE, static_cast<int64_t>(INT_NULL), 4);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data());
+
+		// All rows except row 5 should match (255 matches)
+		CHECK(matchCount == 255);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] != 5);
+		}
+	}
+}
+
+TEST_CASE("VectorFilterEmitter: null checks i64", "[vector-filter-emitter][null-checks]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	constexpr int64_t NUM_ROWS = 256;
+
+	SECTION("gt with nulls: false if either null") {
+		std::vector<int64_t> column(NUM_ROWS);
+		for (int64_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[200] = LONG_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::GT, 10, 8);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		// Rows 11..255 normally match (245). Row 200 is null -> excluded -> 244 matches.
+		CHECK(matchCount == 244);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] != 200);
+		}
+	}
+
+	SECTION("eq with nulls: both-null matches") {
+		std::vector<int64_t> column(NUM_ROWS);
+		for (int64_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = LONG_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::EQ, LONG_NULL, 8);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		CHECK(matchCount == 1);
+		CHECK(rowsBuf[0] == 5);
+	}
+
+	SECTION("ge with nulls: both-null matches, one-null excluded") {
+		std::vector<int64_t> column(NUM_ROWS);
+		for (int64_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = LONG_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::GE, LONG_NULL, 8);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		// Only row 5 matches (both null)
+		CHECK(matchCount == 1);
+		CHECK(rowsBuf[0] == 5);
+	}
+
+	SECTION("ne with nulls: both-null excluded") {
+		std::vector<int64_t> column(NUM_ROWS);
+		for (int64_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+		column[5] = LONG_NULL;
+
+		auto compiled = buildAndCompileFilterWithNullChecks(ir::CompareOperation::NE, LONG_NULL, 8);
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		// All rows except row 5 match
+		CHECK(matchCount == 255);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] != 5);
+		}
+	}
+}
+
+TEST_CASE("VectorFilterEmitter: null checks skipped for i8/i16", "[vector-filter-emitter][null-checks]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	SECTION("i8: sentinel value treated as normal data, not as null") {
+		// i8 sentinel = -128 (0x80). With null checks enabled but typeSize=1, no correction applied.
+		constexpr int64_t NUM_ROWS = 256;
+		std::vector<int8_t> column(NUM_ROWS, 0);
+		column[5] = static_cast<int8_t>(0x80); // -128, same bit pattern as "null" if we used it
+		column[10] = 42;
+
+		// Build with null checks ON but typeSize=1: null checks should be SKIPPED
+		::mlir::DialectRegistry registry;
+		registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+		                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+		registry.insert<::mlir::scf::SCFDialect>();
+		::mlir::func::registerAllExtensions(registry);
+		::mlir::registerBuiltinDialectTranslation(registry);
+		::mlir::registerLLVMDialectTranslation(registry);
+		::mlir::LLVM::registerInlinerInterface(registry);
+
+		::mlir::MLIRContext context(registry);
+		context.disableMultithreading();
+		context.loadAllAvailableDialects();
+
+		nautilus::engine::Options options;
+		options.setOption("vectorFilter.enabled", true);
+		options.setOption("vectorFilter.typeSize", 1);
+		options.setOption("mlir.null_checks", true);
+		nmlir::VectorFilterEmitter emitter(context, options);
+
+		auto module = emitter.generateModuleFromPredicate(ir::CompareOperation::LT, 10, 0);
+		auto compiled = compileModule(module);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		// -128 < 10 is true (signed comparison), so row 5 SHOULD match because null checks are skipped for i8
+		// Plus all rows with value 0 (0 < 10), so that's 254 rows with value 0, plus row 5 with -128
+		// Total: 255 rows (everything except row 10 which has value 42)
+		// Wait, column is initialized to 0, only col[5]=-128, col[10]=42
+		// LT 10: 0 < 10 -> true for 254 rows (all except col[10]=42 and col[5]=-128... no, -128 < 10 is true)
+		// So: 255 rows match (all except col[10] = 42, since 42 < 10 is false)
+		CHECK(matchCount == 255);
+		// Row 5 must be in results (sentinel not treated as null)
+		bool found5 = false;
+		for (int64_t i = 0; i < matchCount; i++) {
+			if (rowsBuf[i] == 5) {
+				found5 = true;
+				break;
+			}
+		}
+		CHECK(found5);
+	}
+
+	SECTION("i16: sentinel value treated as normal data, not as null") {
+		constexpr int64_t NUM_ROWS = 256;
+		std::vector<int16_t> column(NUM_ROWS, 0);
+		column[5] = static_cast<int16_t>(0x8000); // -32768
+		column[10] = 42;
+
+		::mlir::DialectRegistry registry;
+		registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+		                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+		registry.insert<::mlir::scf::SCFDialect>();
+		::mlir::func::registerAllExtensions(registry);
+		::mlir::registerBuiltinDialectTranslation(registry);
+		::mlir::registerLLVMDialectTranslation(registry);
+		::mlir::LLVM::registerInlinerInterface(registry);
+
+		::mlir::MLIRContext context(registry);
+		context.disableMultithreading();
+		context.loadAllAvailableDialects();
+
+		nautilus::engine::Options options;
+		options.setOption("vectorFilter.enabled", true);
+		options.setOption("vectorFilter.typeSize", 2);
+		options.setOption("mlir.null_checks", true);
+		nmlir::VectorFilterEmitter emitter(context, options);
+
+		auto module = emitter.generateModuleFromPredicate(ir::CompareOperation::LT, 10, 0);
+		auto compiled = compileModule(module);
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t colAddr = reinterpret_cast<int64_t>(column.data());
+		int64_t cols[1] = {colAddr};
+		int64_t matchCount = compiled.fn(cols, 1, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, 0);
+
+		// -32768 < 10 is true, so row 5 SHOULD match (null checks skipped for i16)
+		CHECK(matchCount == 255);
+		bool found5 = false;
+		for (int64_t i = 0; i < matchCount; i++) {
+			if (rowsBuf[i] == 5) {
+				found5 = true;
+				break;
+			}
+		}
+		CHECK(found5);
+	}
+}

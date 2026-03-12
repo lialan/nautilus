@@ -6,6 +6,7 @@
 #include "nautilus/compiler/ir/operations/LoadOperation.hpp"
 #include "nautilus/compiler/ir/operations/LogicalOperations/CompareOperation.hpp"
 #include <algorithm>
+#include <climits>
 #include <map>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
@@ -173,6 +174,8 @@ struct EmitContext {
 	::mlir::Type i64Ty;
 	// Column pointers indexed by column index
 	std::map<int, ::mlir::Value> colPtrs;
+	// Whether null checks are enabled (only applied for typeSize >= 4)
+	bool nullChecksEnabled;
 };
 
 /// Emit a vector-mode predicate evaluation, returning a vector<Nxi1> mask.
@@ -210,7 +213,76 @@ static ::mlir::Value emitVectorPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 			    auto splatCst = b.create<::mlir::arith::ConstantOp>(loc, splatAttr);
 
 			    auto pred = comparatorToMLIR(arg.comparator);
-			    return b.create<::mlir::arith::CmpIOp>(loc, pred, colVec, splatCst).getResult();
+			    auto rawMask = b.create<::mlir::arith::CmpIOp>(loc, pred, colVec, splatCst).getResult();
+
+			    // Apply null correction when null checks are enabled and typeSize >= 4
+			    if (ctx.nullChecksEnabled && ctx.typeSize >= 4) {
+				    // Build null sentinel splat
+				    int64_t nullSentinel = (ctx.typeSize == 4) ? static_cast<int64_t>(INT32_MIN) : INT64_MIN;
+				    ::mlir::DenseElementsAttr nullSplatAttr;
+				    if (ctx.typeSize == 4) {
+					    nullSplatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int32_t>(nullSentinel));
+				    } else {
+					    nullSplatAttr =
+					        ::mlir::DenseElementsAttr::get(ctx.vecElemTy, static_cast<int64_t>(nullSentinel));
+				    }
+				    auto nullSplat = b.create<::mlir::arith::ConstantOp>(loc, nullSplatAttr);
+
+				    // Check which elements are null
+				    auto lhsNull =
+				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, colVec, nullSplat);
+				    auto rhsNull =
+				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, splatCst, nullSplat);
+
+				    auto maskType = ::mlir::cast<::mlir::VectorType>(rawMask.getType());
+				    auto trueSplat =
+				        b.create<::mlir::arith::ConstantOp>(loc, ::mlir::DenseElementsAttr::get(maskType, true));
+
+				    using Comp = ir::CompareOperation::Comparator;
+				    switch (arg.comparator) {
+				    case Comp::GT:
+				    case Comp::LT: {
+					    // False if either null: result AND NOT(lhs_null OR rhs_null)
+					    auto eitherNull = b.create<::mlir::arith::OrIOp>(loc, lhsNull, rhsNull);
+					    auto notNull = b.create<::mlir::arith::XOrIOp>(loc, eitherNull, trueSplat);
+					    rawMask = b.create<::mlir::arith::AndIOp>(loc, rawMask, notNull);
+					    break;
+				    }
+				    case Comp::GE:
+				    case Comp::LE: {
+					    // True if both null, false if only one null:
+					    // NOT(opposite) AND NOT(lhs_null XOR rhs_null)
+					    auto oppositePred = (arg.comparator == Comp::GE) ? ::mlir::arith::CmpIPredicate::slt
+					                                                     : ::mlir::arith::CmpIPredicate::sgt;
+					    auto oppositeResult = b.create<::mlir::arith::CmpIOp>(loc, oppositePred, colVec, splatCst);
+					    auto notOpposite = b.create<::mlir::arith::XOrIOp>(loc, oppositeResult, trueSplat);
+					    auto nullXor = b.create<::mlir::arith::XOrIOp>(loc, lhsNull, rhsNull);
+					    auto notNullXor = b.create<::mlir::arith::XOrIOp>(loc, nullXor, trueSplat);
+					    rawMask = b.create<::mlir::arith::AndIOp>(loc, notOpposite, notNullXor);
+					    break;
+				    }
+				    case Comp::EQ: {
+					    // True if both null: (lhs == rhs) OR (lhs_null AND rhs_null)
+					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
+					    rawMask = b.create<::mlir::arith::OrIOp>(loc, rawMask, bothNull);
+					    break;
+				    }
+				    case Comp::NE: {
+					    // NOT(eq with null handling)
+					    auto eqRaw =
+					        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, colVec, splatCst);
+					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
+					    auto eqWithNull = b.create<::mlir::arith::OrIOp>(loc, eqRaw, bothNull);
+					    rawMask = b.create<::mlir::arith::XOrIOp>(loc, eqWithNull, trueSplat);
+					    break;
+				    }
+				    default:
+					    break;
+				    }
+			    }
+
+			    return rawMask;
 
 		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
 			    auto leftMask = emitVectorPredicate(b, loc, arg->left, ctx, iv);
@@ -274,7 +346,71 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 			    }
 
 			    auto pred = comparatorToMLIR(arg.comparator);
-			    return b.create<::mlir::arith::CmpIOp>(loc, pred, val, scalarCst).getResult();
+			    auto rawResult = b.create<::mlir::arith::CmpIOp>(loc, pred, val, scalarCst).getResult();
+
+			    // Apply scalar null correction when null checks are enabled and typeSize >= 4
+			    if (ctx.nullChecksEnabled && ctx.typeSize >= 4) {
+				    // Build null sentinel constant
+				    int64_t nullSentinel = (ctx.typeSize == 4) ? static_cast<int64_t>(INT32_MIN) : INT64_MIN;
+				    ::mlir::Value nullCst;
+				    if (ctx.typeSize == 4) {
+					    nullCst =
+					        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI32Type(), nullSentinel));
+				    } else {
+					    nullCst =
+					        b.create<::mlir::arith::ConstantOp>(loc, b.getIntegerAttr(b.getI64Type(), nullSentinel));
+				    }
+
+				    auto lhsNull = b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, val, nullCst);
+				    auto rhsNull =
+				        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, scalarCst, nullCst);
+
+				    auto trueVal = b.create<::mlir::arith::ConstantOp>(loc, b.getBoolAttr(true));
+
+				    using Comp = ir::CompareOperation::Comparator;
+				    switch (arg.comparator) {
+				    case Comp::GT:
+				    case Comp::LT: {
+					    // False if either null: result AND NOT(lhs_null OR rhs_null)
+					    auto eitherNull = b.create<::mlir::arith::OrIOp>(loc, lhsNull, rhsNull);
+					    auto notNull = b.create<::mlir::arith::XOrIOp>(loc, eitherNull, trueVal);
+					    rawResult = b.create<::mlir::arith::AndIOp>(loc, rawResult, notNull);
+					    break;
+				    }
+				    case Comp::GE:
+				    case Comp::LE: {
+					    // True if both null, false if only one null:
+					    // NOT(opposite) AND NOT(lhs_null XOR rhs_null)
+					    auto oppositePred = (arg.comparator == Comp::GE) ? ::mlir::arith::CmpIPredicate::slt
+					                                                     : ::mlir::arith::CmpIPredicate::sgt;
+					    auto oppositeResult = b.create<::mlir::arith::CmpIOp>(loc, oppositePred, val, scalarCst);
+					    auto notOpposite = b.create<::mlir::arith::XOrIOp>(loc, oppositeResult, trueVal);
+					    auto nullXor = b.create<::mlir::arith::XOrIOp>(loc, lhsNull, rhsNull);
+					    auto notNullXor = b.create<::mlir::arith::XOrIOp>(loc, nullXor, trueVal);
+					    rawResult = b.create<::mlir::arith::AndIOp>(loc, notOpposite, notNullXor);
+					    break;
+				    }
+				    case Comp::EQ: {
+					    // True if both null: (lhs == rhs) OR (lhs_null AND rhs_null)
+					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
+					    rawResult = b.create<::mlir::arith::OrIOp>(loc, rawResult, bothNull);
+					    break;
+				    }
+				    case Comp::NE: {
+					    // NOT(eq with null handling)
+					    auto eqRaw =
+					        b.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::eq, val, scalarCst);
+					    auto bothNull = b.create<::mlir::arith::AndIOp>(loc, lhsNull, rhsNull);
+					    auto eqWithNull = b.create<::mlir::arith::OrIOp>(loc, eqRaw, bothNull);
+					    rawResult = b.create<::mlir::arith::XOrIOp>(loc, eqWithNull, trueVal);
+					    break;
+				    }
+				    default:
+					    break;
+				    }
+			    }
+
+			    return rawResult;
 
 		    } else if constexpr (std::is_same_v<T, std::unique_ptr<AndNode>>) {
 			    auto leftVal = emitScalarPredicate(b, loc, arg->left, ctx, jv);
@@ -380,6 +516,7 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 	ctx.ptrTy = ptrTy;
 	ctx.i64Ty = i64Ty;
 	ctx.colPtrs = colPtrs;
+	ctx.nullChecksEnabled = options.getOptionOrDefault("mlir.null_checks", false);
 
 	// --- Constants ---
 	auto cst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
