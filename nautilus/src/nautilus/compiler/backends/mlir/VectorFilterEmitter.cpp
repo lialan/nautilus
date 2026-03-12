@@ -526,6 +526,7 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 
 	// --- Extract function arguments ---
 	::mlir::Value cols = funcOp.getArgument(0);
+	::mlir::Value vars = funcOp.getArgument(3);
 	::mlir::Value rows = funcOp.getArgument(5);
 	::mlir::Value rowsCount = funcOp.getArgument(6);
 	::mlir::Value rowsStartOffset = funcOp.getArgument(7);
@@ -554,6 +555,7 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 	ctx.i64Ty = i64Ty;
 	ctx.colPtrs = colPtrs;
 	ctx.nullChecksEnabled = options.getOptionOrDefault("mlir.null_checks", false);
+	ctx.vars = vars;
 
 	// ==================== Runtime branch: row-index vs gather ====================
 	// rowsStartOffset >= 0 -> vectorized row-index mode
