@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
 #include <mlir/Dialect/Func/Extensions/AllExtensions.h>
@@ -1329,4 +1330,94 @@ TEST_CASE("VectorFilterEmitter: serialize/deserialize NOT(OR(a,b))", "[vector-fi
 
 	auto& notNode = std::get<std::unique_ptr<nmlir::NotNode>>(restored);
 	REQUIRE(std::holds_alternative<std::unique_ptr<nmlir::OrNode>>(notNode->child));
+}
+
+// ===========================================================================
+// MLIR evidence tests
+// ===========================================================================
+
+TEST_CASE("VectorFilterEmitter: MLIR evidence for runtime var predicate", "[vector-filter-emitter][evidence]") {
+	::mlir::DialectRegistry registry;
+	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+	registry.insert<::mlir::scf::SCFDialect>();
+	::mlir::func::registerAllExtensions(registry);
+	::mlir::registerBuiltinDialectTranslation(registry);
+	::mlir::registerLLVMDialectTranslation(registry);
+	::mlir::LLVM::registerInlinerInterface(registry);
+
+	::mlir::MLIRContext context(registry);
+	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	nautilus::engine::Options options;
+	options.setOption("vectorFilter.typeSize", 4);
+	nmlir::VectorFilterEmitter emitter(context, options);
+
+	nmlir::CompareNode node {ir::CompareOperation::EQ, 0, 0, /*varSlotIndex=*/0, /*isRuntimeVar=*/true};
+	nmlir::PredicateNode root = node;
+	auto module = emitter.generateModuleFromPredicateTree(root);
+
+	std::string mlirStr;
+	llvm::raw_string_ostream os(mlirStr);
+	module->print(os);
+	os.flush();
+
+	// Vectorized operations
+	CHECK(mlirStr.find("vector<16xi32>") != std::string::npos);
+	CHECK(mlirStr.find("arith.cmpi") != std::string::npos);
+	CHECK(mlirStr.find("llvm.intr.masked.compressstore") != std::string::npos);
+	CHECK(mlirStr.find("llvm.intr.ctpop") != std::string::npos);
+	CHECK(mlirStr.find("llvm.shufflevector") != std::string::npos);
+	CHECK(mlirStr.find("scf.for") != std::string::npos);
+	CHECK(mlirStr.find("cf.cond_br") != std::string::npos);
+
+	// Runtime var access: GEP + load + truncate
+	CHECK(mlirStr.find("llvm.getelementptr") != std::string::npos);
+	CHECK(mlirStr.find("llvm.load") != std::string::npos);
+	CHECK(mlirStr.find("arith.trunci") != std::string::npos);
+}
+
+TEST_CASE("VectorFilterEmitter: MLIR evidence for compound runtime var AND", "[vector-filter-emitter][evidence]") {
+	::mlir::DialectRegistry registry;
+	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+	registry.insert<::mlir::scf::SCFDialect>();
+	::mlir::func::registerAllExtensions(registry);
+	::mlir::registerBuiltinDialectTranslation(registry);
+	::mlir::registerLLVMDialectTranslation(registry);
+	::mlir::LLVM::registerInlinerInterface(registry);
+
+	::mlir::MLIRContext context(registry);
+	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	nautilus::engine::Options options;
+	options.setOption("vectorFilter.typeSize", 4);
+	nmlir::VectorFilterEmitter emitter(context, options);
+
+	nmlir::CompareNode left {ir::CompareOperation::GT, 0, 0, 0, true};
+	nmlir::CompareNode right {ir::CompareOperation::LT, 0, 0, 1, true};
+	nmlir::PredicateNode root =
+	    std::make_unique<nmlir::AndNode>(nmlir::AndNode {nmlir::PredicateNode(left), nmlir::PredicateNode(right)});
+	auto module = emitter.generateModuleFromPredicateTree(root);
+
+	std::string mlirStr;
+	llvm::raw_string_ostream os(mlirStr);
+	module->print(os);
+	os.flush();
+
+	// Compound predicate: two comparisons combined with AND
+	// Count arith.cmpi occurrences — should have at least 2 (one per compare)
+	size_t cmpiCount = 0;
+	size_t pos = 0;
+	while ((pos = mlirStr.find("arith.cmpi", pos)) != std::string::npos) {
+		cmpiCount++;
+		pos += 10;
+	}
+	CHECK(cmpiCount >= 2);
+
+	// AND combination
+	CHECK(mlirStr.find("arith.andi") != std::string::npos);
+	CHECK(mlirStr.find("llvm.intr.masked.compressstore") != std::string::npos);
 }
