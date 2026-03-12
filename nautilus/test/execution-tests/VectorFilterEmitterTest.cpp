@@ -1268,3 +1268,65 @@ TEST_CASE("VectorFilterEmitter: compound runtime var AND i32", "[vector-filter-e
 		CHECK(output[i] == 50 + i); // row indices for values 51..54
 	}
 }
+
+// ===========================================================================
+// Serialization round-trip tests
+// ===========================================================================
+
+TEST_CASE("VectorFilterEmitter: serialize/deserialize single compare", "[vector-filter-emitter][serialization]") {
+	nmlir::CompareNode node {ir::CompareOperation::GT, 0, 2, /*varSlotIndex=*/5, /*isRuntimeVar=*/true};
+	nmlir::PredicateNode root = node;
+
+	auto data = nmlir::serializePredicateTree(root);
+	CHECK(data.size() == 8 + 1 * 16); // header + 1 node
+
+	auto restored = nmlir::deserializePredicateTree(data);
+	REQUIRE(std::holds_alternative<nmlir::CompareNode>(restored));
+	auto& cn = std::get<nmlir::CompareNode>(restored);
+	CHECK(cn.comparator == ir::CompareOperation::GT);
+	CHECK(cn.columnIndex == 2);
+	CHECK(cn.varSlotIndex == 5);
+	CHECK(cn.isRuntimeVar == true);
+}
+
+TEST_CASE("VectorFilterEmitter: serialize/deserialize compound AND", "[vector-filter-emitter][serialization]") {
+	nmlir::CompareNode left {ir::CompareOperation::GT, 0, 0, 0, true};
+	nmlir::CompareNode right {ir::CompareOperation::LT, 0, 0, 1, true};
+	nmlir::PredicateNode root =
+	    std::make_unique<nmlir::AndNode>(nmlir::AndNode {nmlir::PredicateNode(left), nmlir::PredicateNode(right)});
+
+	auto data = nmlir::serializePredicateTree(root);
+	CHECK(data.size() == 8 + 3 * 16); // 2 Compare + 1 And
+
+	auto restored = nmlir::deserializePredicateTree(data);
+	REQUIRE(std::holds_alternative<std::unique_ptr<nmlir::AndNode>>(restored));
+
+	auto& andNode = std::get<std::unique_ptr<nmlir::AndNode>>(restored);
+	REQUIRE(std::holds_alternative<nmlir::CompareNode>(andNode->left));
+	REQUIRE(std::holds_alternative<nmlir::CompareNode>(andNode->right));
+
+	auto& leftCn = std::get<nmlir::CompareNode>(andNode->left);
+	CHECK(leftCn.comparator == ir::CompareOperation::GT);
+	CHECK(leftCn.varSlotIndex == 0);
+
+	auto& rightCn = std::get<nmlir::CompareNode>(andNode->right);
+	CHECK(rightCn.comparator == ir::CompareOperation::LT);
+	CHECK(rightCn.varSlotIndex == 1);
+}
+
+TEST_CASE("VectorFilterEmitter: serialize/deserialize NOT(OR(a,b))", "[vector-filter-emitter][serialization]") {
+	nmlir::CompareNode a {ir::CompareOperation::EQ, 0, 0, 0, true};
+	nmlir::CompareNode b {ir::CompareOperation::NE, 0, 1, 1, true};
+	auto orNode =
+	    std::make_unique<nmlir::OrNode>(nmlir::OrNode {nmlir::PredicateNode(a), nmlir::PredicateNode(b)});
+	nmlir::PredicateNode root = std::make_unique<nmlir::NotNode>(nmlir::NotNode {std::move(orNode)});
+
+	auto data = nmlir::serializePredicateTree(root);
+	CHECK(data.size() == 8 + 4 * 16); // 2 Compare + 1 Or + 1 Not
+
+	auto restored = nmlir::deserializePredicateTree(data);
+	REQUIRE(std::holds_alternative<std::unique_ptr<nmlir::NotNode>>(restored));
+
+	auto& notNode = std::get<std::unique_ptr<nmlir::NotNode>>(restored);
+	REQUIRE(std::holds_alternative<std::unique_ptr<nmlir::OrNode>>(notNode->child));
+}
