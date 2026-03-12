@@ -11,7 +11,7 @@
 #include <cstring>
 #include <vector>
 
-#include <llvm-c/Target.h>
+#include <llvm/Support/TargetSelect.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/ControlFlow/IR/ControlFlow.h>
 #include <mlir/Dialect/Func/Extensions/AllExtensions.h>
@@ -34,8 +34,7 @@
 #include "nautilus/compiler/DumpHandler.hpp"
 #include "nautilus/options.hpp"
 
-using namespace nautilus::compiler;
-using namespace nautilus::compiler::mlir;
+namespace nmlir = nautilus::compiler::mlir;
 
 // ---------------------------------------------------------------------------
 // Helper: build the hand-crafted MLIR module that implements a vectorized
@@ -83,7 +82,8 @@ static ::mlir::OwningOpRef<::mlir::ModuleOp> buildVectorFilterModule(::mlir::MLI
 
 	// ---- Load column 0 address from cols[0] ----
 	auto colAddr = builder.create<::mlir::LLVM::LoadOp>(loc, i64Ty, cols, /*alignment=*/8);
-	auto colPtr = builder.create<::mlir::LLVM::IntToPtrOp>(loc, ptrTy, colAddr);
+	auto colPtr = builder.create<::mlir::LLVM::IntToPtrOp>(loc, ptrTy, colAddr,
+	                                                        ::mlir::LLVM::DereferenceableAttr());
 
 	// ---- Constants ----
 	auto cst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
@@ -148,7 +148,7 @@ static ::mlir::OwningOpRef<::mlir::ModuleOp> buildVectorFilterModule(::mlir::MLI
 		    // Compress-store lower half
 		    auto outGep1 =
 		        b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, i64Ty, rows, ::mlir::ValueRange{outIdx});
-		    b.create<::mlir::LLVM::masked_compressstore>(bodyLoc, ridsLo, outGep1, maskLo, /*align=*/8);
+		    b.create<::mlir::LLVM::masked_compressstore>(bodyLoc, ridsLo, outGep1, maskLo);
 
 		    // Popcount lower mask
 		    auto maskLoI8 = b.create<::mlir::LLVM::BitcastOp>(bodyLoc, i8Ty, maskLo);
@@ -159,7 +159,7 @@ static ::mlir::OwningOpRef<::mlir::ModuleOp> buildVectorFilterModule(::mlir::MLI
 		    // Compress-store upper half
 		    auto outGep2 =
 		        b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, i64Ty, rows, ::mlir::ValueRange{idx2});
-		    b.create<::mlir::LLVM::masked_compressstore>(bodyLoc, ridsHi, outGep2, maskHi, /*align=*/8);
+		    b.create<::mlir::LLVM::masked_compressstore>(bodyLoc, ridsHi, outGep2, maskHi);
 
 		    // Popcount upper mask
 		    auto maskHiI8 = b.create<::mlir::LLVM::BitcastOp>(bodyLoc, i8Ty, maskHi);
@@ -232,22 +232,22 @@ static CompiledFilter compileModule(::mlir::OwningOpRef<::mlir::ModuleOp>& modul
 	}
 
 	// Lower through pass pipeline (SCF → CF, arith → LLVM, etc.)
-	if (MLIRPassManager::lowerAndOptimizeMLIRModule(module, {})) {
+	if (nmlir::MLIRPassManager::lowerAndOptimizeMLIRModule(module, {})) {
 		module->dump();
 		FAIL("MLIRPassManager::lowerAndOptimizeMLIRModule failed");
 	}
 
 	// Build the LLVM optimizer pipeline
-	engine::Options options;
+	nautilus::engine::Options options;
 	options.setOption("engine.backend", std::string("mlir"));
-	CompilationUnitID unitId = "VectorFilterSpikeTest";
-	DumpHandler dumpHandler(options, unitId);
-	auto optPipeline = LLVMIROptimizer::getLLVMOptimizerPipeline(options, dumpHandler);
+	nautilus::compiler::CompilationUnitID unitId = "VectorFilterSpikeTest";
+	nautilus::compiler::DumpHandler dumpHandler(options, unitId);
+	auto optPipeline = nmlir::LLVMIROptimizer::getLLVMOptimizerPipeline(options, dumpHandler);
 
 	// JIT compile
 	std::vector<std::string> proxySymbols;
 	std::vector<void*> proxyAddresses;
-	auto engine = JITCompiler::jitCompileModule(module, optPipeline, proxySymbols, proxyAddresses, options);
+	auto engine = nmlir::JITCompiler::jitCompileModule(module, optPipeline, proxySymbols, proxyAddresses, options);
 	REQUIRE(engine != nullptr);
 
 	// Look up the 'execute' function
@@ -264,13 +264,7 @@ static CompiledFilter compileModule(::mlir::OwningOpRef<::mlir::ModuleOp>& modul
 // Test cases
 // ---------------------------------------------------------------------------
 
-TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
-          "[vector-filter-spike]") {
-	// Initialize LLVM native target (idempotent)
-	LLVMInitializeNativeTarget();
-	LLVMInitializeNativeAsmPrinter();
-
-	// Set up MLIR context with all required dialects
+static CompiledFilter buildAndCompile() {
 	::mlir::DialectRegistry registry;
 	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
 	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
@@ -282,11 +276,20 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 
 	::mlir::MLIRContext context(registry);
 	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	auto module = buildVectorFilterModule(context);
+	return compileModule(module);
+}
+
+TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
+          "[vector-filter-spike]") {
+	// Initialize LLVM native target (idempotent)
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
 
 	SECTION("aligned 64-element column, one match at [42]") {
-		// Build module
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		// Prepare test data: 64 int32_t elements, all zero except [42] = 42
 		constexpr int64_t NUM_ROWS = 64;
@@ -317,8 +320,7 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 	}
 
 	SECTION("aligned 64-element column with rowsStartOffset") {
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		constexpr int64_t NUM_ROWS = 64;
 		std::vector<int32_t> column(NUM_ROWS, 0);
@@ -339,8 +341,7 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 	}
 
 	SECTION("misaligned input — offset column pointer by 4 bytes from 64-byte boundary") {
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		// Allocate with extra padding so we can misalign by 4 bytes off a 64-byte boundary.
 		// We need at least 64 * sizeof(int32_t) = 256 bytes of payload,
@@ -374,8 +375,7 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 	}
 
 	SECTION("multiple matches") {
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		constexpr int64_t NUM_ROWS = 64;
 		std::vector<int32_t> column(NUM_ROWS, 0);
@@ -405,8 +405,7 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 	}
 
 	SECTION("no matches") {
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		constexpr int64_t NUM_ROWS = 64;
 		std::vector<int32_t> column(NUM_ROWS, 0); // all zeroes, nothing equals 42
@@ -424,8 +423,7 @@ TEST_CASE("VectorFilterSpike: inttoptr + vector load + compressstore",
 	}
 
 	SECTION("non-multiple-of-16 row count exercises scalar tail") {
-		auto module = buildVectorFilterModule(context);
-		auto compiled = compileModule(module);
+		auto compiled = buildAndCompile();
 
 		// 50 rows: 48 handled by vector loop (3 iters), 2 by scalar tail
 		constexpr int64_t NUM_ROWS = 50;

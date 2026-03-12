@@ -27,7 +27,12 @@ target_include_directories(nautilus-execution-tests PRIVATE
         $<INSTALL_INTERFACE:src/nautilus/>)
 target_include_directories(nautilus-execution-tests PRIVATE
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../src/nautilus/compiler/>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../../src>
 )
+if (ENABLE_MLIR_BACKEND)
+    find_package(MLIR REQUIRED CONFIG)
+    target_include_directories(nautilus-execution-tests SYSTEM PRIVATE ${MLIR_INCLUDE_DIRS})
+endif()
 
 list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 
