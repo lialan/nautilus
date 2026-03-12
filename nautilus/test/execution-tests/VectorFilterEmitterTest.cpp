@@ -1004,3 +1004,166 @@ TEST_CASE("VectorFilterEmitter: null checks skipped for i8/i16", "[vector-filter
 		CHECK(found5);
 	}
 }
+
+// ===========================================================================
+// Dual-mode output tests (row-index vs scalar gather)
+// ===========================================================================
+
+TEST_CASE("VectorFilterEmitter: dual-mode output", "[vector-filter-emitter][dual-mode]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	SECTION("rowsStartOffset >= 0: vectorized row-index mode") {
+		// This is the existing path. Verify that row IDs are offset by rowsStartOffset.
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::GT, 10);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+
+		constexpr int64_t OFFSET = 1000;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), OFFSET);
+
+		// col > 10: rows 11..63 match = 53 rows
+		CHECK(matchCount == 53);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == (11 + i) + OFFSET);
+		}
+	}
+
+	SECTION("rowsStartOffset < 0: scalar gather fallback (gather same column)") {
+		// rowsStartOffset = -(colIdx + 1) = -1 (gather column 0)
+		// Filter: col > 10, gather matching values from col[0]
+		// Expect output to contain the actual int32 values (widened to i64), not row indices
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::GT, 10);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+
+		// rowsStartOffset = -1 means gather column 0: -((-1) + 1) = 0
+		constexpr int64_t GATHER_OFFSET = -1;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), GATHER_OFFSET);
+
+		// col > 10: rows 11..63 match = 53 rows
+		CHECK(matchCount == 53);
+		// Output should contain the gathered VALUES (sign-extended to i64), not row indices
+		for (int64_t i = 0; i < matchCount; i++) {
+			int64_t expectedValue = static_cast<int64_t>(11 + static_cast<int32_t>(i));
+			CHECK(rowsBuf[i] == expectedValue);
+		}
+	}
+
+	SECTION("rowsStartOffset < 0: scalar gather with different gather column") {
+		// Two columns: col0 is the filter column, col1 is the gather column
+		// Filter: col0 > 10, gather from col1
+		// rowsStartOffset = -(1 + 1) = -2 (gather column 1)
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> filterCol(NUM_ROWS);
+		std::vector<int32_t> gatherCol(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			filterCol[i] = i;       // 0, 1, 2, ..., 63
+			gatherCol[i] = i * 100; // 0, 100, 200, ..., 6300
+		}
+
+		// Build a filter on column 0: col0 > 10
+		nmlir::CompareNode node {ir::CompareOperation::GT, 10, 0};
+		nmlir::PredicateNode root = node;
+		auto compiled = buildAndCompilePredicateTree(root);
+
+		// rowsStartOffset = -2 means gather column 1: -((-2) + 1) = 1
+		constexpr int64_t GATHER_OFFSET = -2;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t cols[2] = {reinterpret_cast<int64_t>(filterCol.data()), reinterpret_cast<int64_t>(gatherCol.data())};
+		int64_t matchCount = compiled.fn(cols, 2, nullptr, nullptr, 0, rowsBuf.data(), NUM_ROWS, GATHER_OFFSET);
+
+		// col0 > 10: rows 11..63 match = 53 rows
+		CHECK(matchCount == 53);
+		// Output should contain gatherCol values at matching rows
+		for (int64_t i = 0; i < matchCount; i++) {
+			int64_t expectedValue = static_cast<int64_t>((11 + static_cast<int32_t>(i)) * 100);
+			CHECK(rowsBuf[i] == expectedValue);
+		}
+	}
+
+	SECTION("rowsStartOffset < 0: gather with no matches") {
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::EQ, 999);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i;
+		}
+
+		constexpr int64_t GATHER_OFFSET = -1;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), GATHER_OFFSET);
+
+		CHECK(matchCount == 0);
+	}
+
+	SECTION("rowsStartOffset < 0: gather with all matches") {
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::GE, 0);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = i + 1; // 1, 2, ..., 64
+		}
+
+		constexpr int64_t GATHER_OFFSET = -1;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), GATHER_OFFSET);
+
+		CHECK(matchCount == NUM_ROWS);
+		for (int64_t i = 0; i < matchCount; i++) {
+			CHECK(rowsBuf[i] == static_cast<int64_t>(i + 1));
+		}
+	}
+
+	SECTION("rowsStartOffset < 0: gather with negative values (sign extension)") {
+		// Verify sign extension works correctly for negative i32 values
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::LT, 0);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS);
+		for (int32_t i = 0; i < NUM_ROWS; i++) {
+			column[i] = static_cast<int32_t>(i) - 32; // -32, -31, ..., 31
+		}
+
+		constexpr int64_t GATHER_OFFSET = -1;
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), GATHER_OFFSET);
+
+		// col < 0: values -32..-1 match = 32 rows
+		CHECK(matchCount == 32);
+		for (int64_t i = 0; i < matchCount; i++) {
+			int32_t originalVal = static_cast<int32_t>(i) - 32;
+			int64_t expectedWidened = static_cast<int64_t>(originalVal);
+			CHECK(rowsBuf[i] == expectedWidened);
+		}
+	}
+
+	SECTION("rowsStartOffset = 0: row-index mode (boundary case)") {
+		// rowsStartOffset = 0 is exactly the boundary, should use vectorized path
+		auto compiled = buildAndCompileFilter(ir::CompareOperation::EQ, 42);
+
+		constexpr int64_t NUM_ROWS = 64;
+		std::vector<int32_t> column(NUM_ROWS, 0);
+		column[10] = 42;
+		column[42] = 42;
+
+		std::vector<int64_t> rowsBuf(NUM_ROWS, -1);
+		int64_t matchCount = runFilter(compiled, column.data(), NUM_ROWS, rowsBuf.data(), 0);
+
+		CHECK(matchCount == 2);
+		CHECK(rowsBuf[0] == 10);
+		CHECK(rowsBuf[1] == 42);
+	}
+}

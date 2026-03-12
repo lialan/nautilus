@@ -9,6 +9,7 @@
 #include <climits>
 #include <map>
 #include <mlir/Dialect/Arith/IR/Arith.h>
+#include <mlir/Dialect/ControlFlow/IR/ControlFlowOps.h>
 #include <mlir/Dialect/LLVMIR/LLVMDialect.h>
 #include <mlir/Dialect/LLVMIR/LLVMTypes.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
@@ -518,9 +519,26 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 	ctx.colPtrs = colPtrs;
 	ctx.nullChecksEnabled = options.getOptionOrDefault("mlir.null_checks", false);
 
-	// --- Constants ---
+	// ==================== Runtime branch: row-index vs gather ====================
+	// rowsStartOffset >= 0 -> vectorized row-index mode
+	// rowsStartOffset < 0  -> scalar gather mode (gatherColIdx = -(rowsStartOffset + 1))
 	auto cst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
-	auto cst1 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(1));
+	auto isRowMode =
+	    builder.create<::mlir::arith::CmpIOp>(loc, ::mlir::arith::CmpIPredicate::sge, rowsStartOffset, cst0);
+
+	// Create the two destination blocks inside the function's region
+	auto& funcRegion = funcOp.getBody();
+	auto* vectorizedBlock = new ::mlir::Block();
+	auto* scalarGatherBlock = new ::mlir::Block();
+	funcRegion.push_back(vectorizedBlock);
+	funcRegion.push_back(scalarGatherBlock);
+
+	builder.create<::mlir::cf::CondBranchOp>(loc, isRowMode, vectorizedBlock, /*trueArgs=*/::mlir::ValueRange {},
+	                                         scalarGatherBlock, /*falseArgs=*/::mlir::ValueRange {});
+
+	// ========================== Vectorized row-index path ==========================
+	builder.setInsertionPointToStart(vectorizedBlock);
+
 	auto cstVecWidth = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(vectorWidth));
 
 	// vec_limit = rowsCount - (rowsCount % vectorWidth)
@@ -533,10 +551,13 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 		numGroups = 1;
 	}
 
+	auto vecCst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
+	auto vecCst1 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(1));
+
 	// ========================== Vectorized main loop ==========================
 	auto vecLoop = builder.create<::mlir::scf::ForOp>(
-	    loc, /*lb=*/cst0.getResult(), /*ub=*/vecLimit.getResult(), /*step=*/cstVecWidth.getResult(),
-	    /*iterArgs=*/::mlir::ValueRange {cst0.getResult()},
+	    loc, /*lb=*/vecCst0.getResult(), /*ub=*/vecLimit.getResult(), /*step=*/cstVecWidth.getResult(),
+	    /*iterArgs=*/::mlir::ValueRange {vecCst0.getResult()},
 	    [&](::mlir::OpBuilder& b, ::mlir::Location bodyLoc, ::mlir::Value iv, ::mlir::ValueRange iterArgs) {
 		    ::mlir::Value outIdx = iterArgs[0];
 
@@ -588,7 +609,7 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 
 	// ============================ Scalar tail loop ============================
 	auto scalarLoop = builder.create<::mlir::scf::ForOp>(
-	    loc, /*lb=*/vecLimit.getResult(), /*ub=*/rowsCount, /*step=*/cst1.getResult(),
+	    loc, /*lb=*/vecLimit.getResult(), /*ub=*/rowsCount, /*step=*/vecCst1.getResult(),
 	    /*iterArgs=*/::mlir::ValueRange {vecOut},
 	    [&](::mlir::OpBuilder& b, ::mlir::Location bodyLoc, ::mlir::Value jv, ::mlir::ValueRange iterArgs) {
 		    ::mlir::Value tidx = iterArgs[0];
@@ -613,6 +634,54 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 
 	::mlir::Value totalMatches = scalarLoop.getResult(0);
 	builder.create<::mlir::LLVM::ReturnOp>(loc, ::mlir::ValueRange {totalMatches});
+
+	// ========================== Scalar gather path ==========================
+	builder.setInsertionPointToStart(scalarGatherBlock);
+
+	// Decode gatherColIdx = -(rowsStartOffset + 1)
+	auto gCst1 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(1));
+	auto gCst0 = builder.create<::mlir::arith::ConstantOp>(loc, builder.getI64IntegerAttr(0));
+	auto negOffsetPlusOne = builder.create<::mlir::arith::AddIOp>(loc, rowsStartOffset, gCst1);
+	auto gatherColIdx = builder.create<::mlir::arith::SubIOp>(loc, gCst0, negOffsetPlusOne);
+
+	// Load gather column pointer: cols[gatherColIdx] -> inttoptr
+	auto gatherGep = builder.create<::mlir::LLVM::GEPOp>(loc, ptrTy, i64Ty, cols, ::mlir::ValueRange {gatherColIdx});
+	auto gatherAddr = builder.create<::mlir::LLVM::LoadOp>(loc, i64Ty, gatherGep, /*alignment=*/8);
+	auto gatherPtr =
+	    builder.create<::mlir::LLVM::IntToPtrOp>(loc, ptrTy, gatherAddr, ::mlir::LLVM::DereferenceableAttr());
+
+	// Scalar gather loop: for each row, evaluate predicate; if match, load from gather col, widen to i64, store
+	auto gatherLoop = builder.create<::mlir::scf::ForOp>(
+	    loc, /*lb=*/gCst0.getResult(), /*ub=*/rowsCount, /*step=*/gCst1.getResult(),
+	    /*iterArgs=*/::mlir::ValueRange {gCst0.getResult()},
+	    [&](::mlir::OpBuilder& b, ::mlir::Location bodyLoc, ::mlir::Value rowIdx, ::mlir::ValueRange iterArgs) {
+		    ::mlir::Value outIdx = iterArgs[0];
+
+		    // Evaluate scalar predicate for this row
+		    auto match = emitScalarPredicate(b, bodyLoc, root, ctx, rowIdx);
+
+		    // Load i32 value from gather column at rowIdx
+		    auto gatherElemGep =
+		        b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, i32Ty, gatherPtr, ::mlir::ValueRange {rowIdx});
+		    auto gatherVal = b.create<::mlir::LLVM::LoadOp>(bodyLoc, i32Ty, gatherElemGep, /*alignment=*/4);
+
+		    // Widen i32 -> i64 via sign extension
+		    auto widened = b.create<::mlir::arith::ExtSIOp>(bodyLoc, i64Ty, gatherVal);
+
+		    // Branchless store: always store, advance by select(match, 1, 0)
+		    auto outGep = b.create<::mlir::LLVM::GEPOp>(bodyLoc, ptrTy, i64Ty, rows, ::mlir::ValueRange {outIdx});
+		    b.create<::mlir::LLVM::StoreOp>(bodyLoc, widened, outGep, /*alignment=*/8);
+
+		    auto one = b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getI64IntegerAttr(1));
+		    auto zero = b.create<::mlir::arith::ConstantOp>(bodyLoc, b.getI64IntegerAttr(0));
+		    auto advance = b.create<::mlir::arith::SelectOp>(bodyLoc, match, one, zero);
+		    auto newOutIdx = b.create<::mlir::arith::AddIOp>(bodyLoc, outIdx, advance);
+
+		    b.create<::mlir::scf::YieldOp>(bodyLoc, ::mlir::ValueRange {newOutIdx});
+	    });
+
+	::mlir::Value gatherCount = gatherLoop.getResult(0);
+	builder.create<::mlir::LLVM::ReturnOp>(loc, ::mlir::ValueRange {gatherCount});
 
 	return module;
 }
