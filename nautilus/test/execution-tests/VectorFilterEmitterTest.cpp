@@ -1167,3 +1167,104 @@ TEST_CASE("VectorFilterEmitter: dual-mode output", "[vector-filter-emitter][dual
 		CHECK(rowsBuf[1] == 42);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Helper: compile a runtime-var predicate tree.
+// ---------------------------------------------------------------------------
+static CompiledFilter buildAndCompileRuntimeVarFilter(const nmlir::PredicateNode& root, int typeSize = 4) {
+	::mlir::DialectRegistry registry;
+	registry.insert<::mlir::arith::ArithDialect, ::mlir::cf::ControlFlowDialect, ::mlir::math::MathDialect,
+	                ::mlir::LLVM::LLVMDialect, ::mlir::func::FuncDialect>();
+	registry.insert<::mlir::scf::SCFDialect>();
+	::mlir::func::registerAllExtensions(registry);
+	::mlir::registerBuiltinDialectTranslation(registry);
+	::mlir::registerLLVMDialectTranslation(registry);
+	::mlir::LLVM::registerInlinerInterface(registry);
+
+	::mlir::MLIRContext context(registry);
+	context.disableMultithreading();
+	context.loadAllAvailableDialects();
+
+	nautilus::engine::Options options;
+	options.setOption("vectorFilter.enabled", true);
+	options.setOption("vectorFilter.typeSize", typeSize);
+	nmlir::VectorFilterEmitter emitter(context, options);
+
+	auto module = emitter.generateModuleFromPredicateTree(root);
+	return compileModule(module);
+}
+
+TEST_CASE("VectorFilterEmitter: runtime var slot EQ i32", "[vector-filter-emitter]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	nmlir::CompareNode node {ir::CompareOperation::EQ, 0, 0, /*varSlotIndex=*/0, /*isRuntimeVar=*/true};
+	nmlir::PredicateNode root = node;
+	auto compiled = buildAndCompileRuntimeVarFilter(root);
+
+	constexpr int N = 64;
+	std::vector<int32_t> col(N);
+	for (int i = 0; i < N; i++) {
+		col[i] = i + 1;
+	}
+
+	int64_t colAddr = reinterpret_cast<int64_t>(col.data());
+	int64_t colsArr[1] = {colAddr};
+	std::vector<int64_t> vars = {42};
+	std::vector<int64_t> output(N, -1);
+
+	int64_t matches = compiled.fn(colsArr, 1, nullptr, vars.data(), 1, output.data(), N, /*rowsStartOffset=*/0);
+
+	CHECK(matches == 1);
+	CHECK(output[0] == 41); // 0-based row index of value 42
+
+	// Reuse same compiled code with different var value (cache compatibility)
+	vars[0] = 10;
+	std::fill(output.begin(), output.end(), -1);
+	matches = compiled.fn(colsArr, 1, nullptr, vars.data(), 1, output.data(), N, /*rowsStartOffset=*/0);
+
+	CHECK(matches == 1);
+	CHECK(output[0] == 9); // 0-based row index of value 10
+}
+
+TEST_CASE("VectorFilterEmitter: compound runtime var AND i32", "[vector-filter-emitter]") {
+	llvm::InitializeNativeTarget();
+	llvm::InitializeNativeTargetAsmPrinter();
+
+	// col > vars[0] AND col < vars[1]
+	nmlir::CompareNode left {ir::CompareOperation::GT, 0, 0, /*varSlotIndex=*/0, /*isRuntimeVar=*/true};
+	nmlir::CompareNode right {ir::CompareOperation::LT, 0, 0, /*varSlotIndex=*/1, /*isRuntimeVar=*/true};
+	nmlir::PredicateNode root =
+	    std::make_unique<nmlir::AndNode>(nmlir::AndNode {nmlir::PredicateNode(left), nmlir::PredicateNode(right)});
+
+	auto compiled = buildAndCompileRuntimeVarFilter(root);
+
+	constexpr int N = 64;
+	std::vector<int32_t> col(N);
+	for (int i = 0; i < N; i++) {
+		col[i] = i + 1;
+	}
+
+	int64_t colAddr = reinterpret_cast<int64_t>(col.data());
+	int64_t colsArr[1] = {colAddr};
+	std::vector<int64_t> vars = {10, 20}; // col > 10 AND col < 20 -> rows 11..19
+	std::vector<int64_t> output(N, -1);
+
+	int64_t matches = compiled.fn(colsArr, 1, nullptr, vars.data(), 2, output.data(), N, /*rowsStartOffset=*/0);
+
+	CHECK(matches == 9);
+	for (int i = 0; i < 9; i++) {
+		CHECK(output[i] == 10 + i); // row indices for values 11..19
+	}
+
+	// Reuse with different vars: col > 50 AND col < 55 -> rows 51..54
+	vars[0] = 50;
+	vars[1] = 55;
+	std::fill(output.begin(), output.end(), -1);
+	matches = compiled.fn(colsArr, 1, nullptr, vars.data(), 2, output.data(), N, /*rowsStartOffset=*/0);
+
+	CHECK(matches == 4);
+	for (int i = 0; i < 4; i++) {
+		CHECK(output[i] == 50 + i); // row indices for values 51..54
+	}
+}
