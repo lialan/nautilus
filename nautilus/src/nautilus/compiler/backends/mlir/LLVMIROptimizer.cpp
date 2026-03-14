@@ -5,8 +5,10 @@
 #include "nautilus/compiler/backends/mlir/LLVMInliningUtils.hpp"
 #include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/IR/Attributes.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IRReader/IRReader.h>
 #include <llvm/Support/FileCollector.h>
+#include <llvm/Support/SmallVectorMemoryBuffer.h>
 #include <mlir/ExecutionEngine/OptUtils.h>
 
 namespace nautilus::compiler::mlir {
@@ -58,6 +60,17 @@ std::function<llvm::Error(llvm::Module*)> LLVMIROptimizer::getLLVMOptimizerPipel
 			llvm::raw_string_ostream llvmStringStream(llvmIRString);
 			llvmIRModule->print(llvmStringStream, nullptr);
 			return llvmIRString;
+		});
+
+		handler.dump("after_llvm_assembly", "s", [&]() {
+			llvm::SmallVector<char, 0> asmBuf;
+			llvm::raw_svector_ostream asmStream(asmBuf);
+			llvm::legacy::PassManager pm;
+			if (targetMachinePtr->addPassesToEmitFile(pm, asmStream, nullptr, llvm::CodeGenFileType::AssemblyFile)) {
+				return std::string("(assembly emission not supported)");
+			}
+			pm.run(*llvmIRModule);
+			return std::string(asmBuf.begin(), asmBuf.end());
 		});
 
 		return optimizedModule;

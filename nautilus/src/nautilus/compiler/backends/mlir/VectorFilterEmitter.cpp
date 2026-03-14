@@ -488,8 +488,9 @@ static ::mlir::Value emitScalarPredicate(::mlir::OpBuilder& b, ::mlir::Location 
 	auto i64Ty = builder.getI64Type();
 	auto ptrTy = ::mlir::LLVM::LLVMPointerType::get(&context);
 
-	// Compute vector width from typeSize: vectorWidth = 512 / (typeSize * 8) = 64 / typeSize
-	int vectorWidth = 64 / typeSize;
+	// vectorBits: 512 for AVX-512 (default), 256 for AVX2
+	int vectorBits = options.getOptionOrDefault("vectorFilter.vectorBits", 512);
+	int vectorWidth = vectorBits / (typeSize * 8);
 	// Element MLIR type based on typeSize
 	::mlir::Type elemTy;
 	switch (typeSize) {
