@@ -1004,6 +1004,31 @@ void MLIRLoweringProvider::generateMLIR(ir::CastOperation* castOperation, MLIRLo
 		// we skip the cast if input and output is the same stamp.
 		frame.setValue(castOperation->getIdentifier(), mlirInput);
 		return;
+	} else if (isInteger(inputStamp) && outputStamp == Type::ptr) {
+		// Cast integer to pointer (inttoptr)
+		auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+		// Ensure input is i64 — extend if narrower
+		auto i64Input = mlirInput;
+		if (getBitWith(inputStamp) < 64) {
+			auto i64Type = builder->getI64Type();
+			if (isSignedInteger(inputStamp)) {
+				i64Input = builder->create<mlir::arith::ExtSIOp>(getNameLoc("location"), i64Type, mlirInput);
+			} else {
+				i64Input = builder->create<mlir::arith::ExtUIOp>(getNameLoc("location"), i64Type, mlirInput);
+			}
+		}
+		auto mlirCast = builder->create<mlir::LLVM::IntToPtrOp>(getNameLoc("location"), ptrType, i64Input);
+		frame.setValue(castOperation->getIdentifier(), mlirCast);
+		return;
+	} else if (inputStamp == Type::ptr && isInteger(outputStamp)) {
+		// Cast pointer to integer (ptrtoint)
+		auto mlirCast = builder->create<mlir::LLVM::PtrToIntOp>(getNameLoc("location"), outputType, mlirInput);
+		frame.setValue(castOperation->getIdentifier(), mlirCast);
+		return;
+	} else if (inputStamp == Type::ptr && outputStamp == Type::ptr) {
+		// ptr to ptr — identity
+		frame.setValue(castOperation->getIdentifier(), mlirInput);
+		return;
 	} else if (getBitWith(inputStamp) < getBitWith(outputStamp)) {
 		// upcast
 		if (isSignedInteger(inputStamp) && (isUnsignedInteger(outputStamp) || isSignedInteger(outputStamp))) {
