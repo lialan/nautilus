@@ -232,7 +232,8 @@ void CPPLoweringProvider::LoweringContext::process(const ir::BasicBlockInvocatio
 			blockArguments << getType(blockTargetArguments[i]->getStamp()) << " " << var << ";\n";
 		}
 
-		blocks[blockIndex] << parentFrame.getValue(blockTargetArgument) << " = " << "temp_" << i << ";\n";
+		blocks[blockIndex] << parentFrame.getValue(blockTargetArgument) << " = "
+		                   << "temp_" << i << ";\n";
 	}
 	blocks[blockIndex] << "}\n";
 }
@@ -513,7 +514,15 @@ void CPPLoweringProvider::LoweringContext::process(ir::CastOperation* castOp, sh
 		blockArguments << targetType << " " << var << ";\n";
 		frame.setValue(castOp->getIdentifier(), var);
 	}
-	blocks[blockIndex] << var << " = (" << targetType << ")" << input << ";\n";
+	auto inputStamp = castOp->getInput()->getStamp();
+	auto outputStamp = castOp->getStamp();
+	bool ptrToArith = (inputStamp == Type::ptr && outputStamp != Type::ptr);
+	bool arithToPtr = (inputStamp != Type::ptr && outputStamp == Type::ptr);
+	if (ptrToArith || arithToPtr) {
+		blocks[blockIndex] << var << " = (" << targetType << ")(uintptr_t)" << input << ";\n";
+	} else {
+		blocks[blockIndex] << var << " = (" << targetType << ")" << input << ";\n";
+	}
 }
 
 void CPPLoweringProvider::LoweringContext::process(ir::SelectOperation* selectOp, short blockIndex,

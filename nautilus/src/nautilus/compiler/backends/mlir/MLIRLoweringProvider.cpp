@@ -1025,6 +1025,21 @@ void MLIRLoweringProvider::generateMLIR(ir::CastOperation* castOperation, MLIRLo
 		auto mlirCast = builder->create<mlir::LLVM::PtrToIntOp>(getNameLoc("location"), outputType, mlirInput);
 		frame.setValue(castOperation->getIdentifier(), mlirCast);
 		return;
+	} else if (inputStamp == Type::ptr && isFloat(outputStamp)) {
+		// Cast pointer to float: ptr → i64 (ptrtoint) → float (uitofp)
+		auto i64Type = builder->getI64Type();
+		auto i64Value = builder->create<mlir::LLVM::PtrToIntOp>(getNameLoc("location"), i64Type, mlirInput);
+		auto mlirCast = builder->create<mlir::arith::UIToFPOp>(getNameLoc("location"), outputType, i64Value);
+		frame.setValue(castOperation->getIdentifier(), mlirCast);
+		return;
+	} else if (isFloat(inputStamp) && outputStamp == Type::ptr) {
+		// Cast float to pointer: float → i64 (fptoui) → ptr (inttoptr)
+		auto i64Type = builder->getI64Type();
+		auto i64Value = builder->create<mlir::arith::FPToUIOp>(getNameLoc("location"), i64Type, mlirInput).getResult();
+		auto ptrType = mlir::LLVM::LLVMPointerType::get(context);
+		auto mlirCast = builder->create<mlir::LLVM::IntToPtrOp>(getNameLoc("location"), ptrType, i64Value);
+		frame.setValue(castOperation->getIdentifier(), mlirCast);
+		return;
 	} else if (inputStamp == Type::ptr && outputStamp == Type::ptr) {
 		// ptr to ptr — identity
 		frame.setValue(castOperation->getIdentifier(), mlirInput);

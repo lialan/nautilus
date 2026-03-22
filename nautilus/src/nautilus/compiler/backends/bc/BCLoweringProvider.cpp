@@ -1830,6 +1830,9 @@ void BCLoweringProvider::LoweringContext::process(ir::CastOperation* castOp, sho
 		case Type::f64:
 			bc = ByteCode::CAST_f_d;
 			break;
+		case Type::ptr:
+			bc = ByteCode::CAST_f_ui64;
+			break;
 		default:
 			throw NotImplementedException("This type is not supported.");
 		}
@@ -1861,6 +1864,9 @@ void BCLoweringProvider::LoweringContext::process(ir::CastOperation* castOp, sho
 			break;
 		case Type::f32:
 			bc = ByteCode::CAST_d_f;
+			break;
+		case Type::ptr:
+			bc = ByteCode::CAST_d_ui64;
 			break;
 		default:
 			throw NotImplementedException("This type is not supported.");

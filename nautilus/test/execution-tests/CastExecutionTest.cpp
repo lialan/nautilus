@@ -101,11 +101,100 @@ void castTest(engine::NautilusEngine& engine) {
 	// std::numeric_limits<double>::min(), std::numeric_limits<double>::max());
 }
 
+void ptrCastTest(engine::NautilusEngine& engine) {
+	// ptr → integer casts
+	SECTION("ptr_to_i8") {
+		auto f = engine.registerFunction(staticCastExpression<void*, int8_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<int8_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_i16") {
+		auto f = engine.registerFunction(staticCastExpression<void*, int16_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<int16_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_i32") {
+		auto f = engine.registerFunction(staticCastExpression<void*, int32_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<int32_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_i64") {
+		auto f = engine.registerFunction(staticCastExpression<void*, int64_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<int64_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_ui8") {
+		auto f = engine.registerFunction(staticCastExpression<void*, uint8_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<uint8_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_ui16") {
+		auto f = engine.registerFunction(staticCastExpression<void*, uint16_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<uint16_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_ui32") {
+		auto f = engine.registerFunction(staticCastExpression<void*, uint32_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<uint32_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_ui64") {
+		auto f = engine.registerFunction(staticCastExpression<void*, uint64_t>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	// ptr → float casts
+	SECTION("ptr_to_float") {
+		auto f = engine.registerFunction(staticCastExpression<void*, float>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<float>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	SECTION("ptr_to_double") {
+		auto f = engine.registerFunction(staticCastExpression<void*, double>);
+		int32_t x = 42;
+		void* ptr = &x;
+		REQUIRE(f(ptr) == static_cast<double>(reinterpret_cast<uintptr_t>(ptr)));
+	}
+	// integer → ptr casts (round-trip verification)
+	SECTION("i64_to_ptr") {
+		auto f = engine.registerFunction(staticCastExpression<int64_t, void*>);
+		int32_t x = 42;
+		auto intVal = static_cast<int64_t>(reinterpret_cast<uintptr_t>(&x));
+		REQUIRE(f(intVal) == reinterpret_cast<void*>(static_cast<uintptr_t>(intVal)));
+	}
+	SECTION("ui64_to_ptr") {
+		auto f = engine.registerFunction(staticCastExpression<uint64_t, void*>);
+		int32_t x = 42;
+		auto intVal = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(&x));
+		REQUIRE(f(intVal) == reinterpret_cast<void*>(static_cast<uintptr_t>(intVal)));
+	}
+	// round-trip: ptr → i64 → ptr
+	SECTION("ptr_roundtrip_i64") {
+		auto ptrToInt = engine.registerFunction(staticCastExpression<void*, int64_t>);
+		auto intToPtr = engine.registerFunction(staticCastExpression<int64_t, void*>);
+		int32_t x = 42;
+		void* original = &x;
+		auto asInt = ptrToInt(original);
+		auto backToPtr = intToPtr(asInt);
+		REQUIRE(backToPtr == original);
+	}
+}
+
 TEST_CASE("Cast Interpreter Test") {
 	engine::Options options;
 	options.setOption("engine.Compilation", false);
 	auto engine = engine::NautilusEngine(options);
 	castTest(engine);
+	ptrCastTest(engine);
 }
 
 #ifdef ENABLE_TRACING
@@ -133,6 +222,30 @@ TEST_CASE("Cast Compiler Test") {
 				auto engine = engine::NautilusEngine(options);
 				castTest(engine);
 			}
+		}
+	}
+}
+#endif
+
+#ifdef ENABLE_TRACING
+TEST_CASE("Pointer Cast Compiler Test") {
+	std::vector<std::string> backends = {};
+#ifdef ENABLE_MLIR_BACKEND
+	backends.emplace_back("mlir");
+#endif
+#ifdef ENABLE_C_BACKEND
+	backends.emplace_back("cpp");
+#endif
+#ifdef ENABLE_BC_BACKEND
+	backends.emplace_back("bc");
+#endif
+	// NOTE: asmjit excluded — no ptr cast lowering support
+	for (auto& backend : backends) {
+		DYNAMIC_SECTION(backend) {
+			engine::Options options;
+			options.setOption("engine.backend", backend);
+			auto engine = engine::NautilusEngine(options);
+			ptrCastTest(engine);
 		}
 	}
 }
