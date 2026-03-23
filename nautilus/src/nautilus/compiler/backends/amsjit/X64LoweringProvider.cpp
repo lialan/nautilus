@@ -282,22 +282,10 @@ void AsmJitLoweringProvider::LoweringContext::processBlockInvocation(const ir::B
 
 void AsmJitLoweringProvider::LoweringContext::processOperation(const std::unique_ptr<ir::Operation>& op,
                                                                RegisterFrame& frame) {
-	// AllocaOp, IndirectCallOp, FunctionAddressOfOp are not in the OperationType
-	// enum in this version of the IR API. Dispatch them via dynamic_cast before
-	// the enum-based switch so the compiler does not see unknown enum values.
-	// op.get() returns a non-const pointer, so dynamic_cast yields a mutable ptr.
-	if (auto* allocaOp = dynamic_cast<ir::AllocaOperation*>(op.get())) {
-		processAlloca(allocaOp, frame);
-		return;
-	}
-	if (auto* indirectCallOp = dynamic_cast<ir::IndirectCallOperation*>(op.get())) {
-		processIndirectCall(indirectCallOp, frame);
-		return;
-	}
-	if (auto* fnAddrOp = dynamic_cast<ir::FunctionAddressOfOperation*>(op.get())) {
-		processFunctionAddressOf(fnAddrOp, frame);
-		return;
-	}
+	// Note: AllocaOp, IndirectCallOp, FunctionAddressOfOp are not compiled into
+	// the current build (not in operations/CMakeLists.txt). They are not used by
+	// QuestDB filter expressions. If needed later, add their .cpp files to the
+	// operations CMakeLists and re-enable the dynamic_cast dispatch here.
 
 	using OT = ir::Operation::OperationType;
 	switch (op->getOperationType()) {
@@ -843,13 +831,9 @@ void AsmJitLoweringProvider::LoweringContext::processStore(ir::StoreOperation* o
 	}
 }
 
-void AsmJitLoweringProvider::LoweringContext::processAlloca(ir::AllocaOperation* op, RegisterFrame& frame) {
-	// Allocate aligned stack space and capture its address in a GP register.
-	auto stackMem = cc.newStack(static_cast<uint32_t>(op->getSize()), 8 /*align*/);
-	auto ptrReg = cc.newIntPtr();
-	cc.lea(ptrReg, stackMem);
-	frame.setValue(op->getIdentifier(), AsmReg(ptrReg));
-}
+// processAlloca, processIndirectCall, processFunctionAddressOf are disabled:
+// their Operation types (AllocaOperation, IndirectCallOperation, FunctionAddressOfOperation)
+// are not compiled into the current build. QuestDB filter expressions don't use them.
 
 // ── External function calls ───────────────────────────────────────────────────
 
@@ -889,52 +873,7 @@ void AsmJitLoweringProvider::LoweringContext::processProxyCall(ir::ProxyCallOper
 	}
 }
 
-void AsmJitLoweringProvider::LoweringContext::processIndirectCall(ir::IndirectCallOperation* op, RegisterFrame& frame) {
-	// Build callee signature from IR type information.
-	FuncSignature sig;
-	sig.setRet(getTypeId(op->getStamp()));
-	for (auto* arg : op->getInputArguments()) {
-		sig.addArg(getTypeId(arg->getStamp()));
-	}
-
-	// The function pointer is a runtime GP register value.
-	auto fnPtrGp = toGp(frame.getValue(op->getFunctionPtrOperand()->getIdentifier()));
-
-	InvokeNode* invokeNode = nullptr;
-	cc.invoke(&invokeNode, fnPtrGp, sig);
-
-	const auto inputArgs = op->getInputArguments();
-	for (size_t i = 0; i < inputArgs.size(); i++) {
-		auto argReg = frame.getValue(inputArgs[i]->getIdentifier());
-		if (std::holds_alternative<Xmm>(argReg))
-			invokeNode->setArg(i, toXmm(argReg));
-		else
-			invokeNode->setArg(i, toGp(argReg));
-	}
-
-	if (op->getStamp() != Type::v) {
-		auto result = allocReg(op->getStamp());
-		if (std::holds_alternative<Xmm>(result))
-			invokeNode->setRet(0, toXmm(result));
-		else
-			invokeNode->setRet(0, toGp(result));
-		frame.setValue(op->getIdentifier(), result);
-	}
-}
-
-void AsmJitLoweringProvider::LoweringContext::processFunctionAddressOf(ir::FunctionAddressOfOperation* op,
-                                                                       RegisterFrame& frame) {
-	auto reg = allocReg(Type::ptr);
-	auto it = funcNodes_.find(op->getFunctionName());
-	if (it != funcNodes_.end()) {
-		// Load the JIT function's address via RIP-relative LEA — resolved at finalize().
-		cc.lea(toGp(reg), x86::ptr(it->second->label()));
-	} else {
-		// External function: embed the raw pointer as a compile-time constant.
-		cc.mov(toGp(reg), reinterpret_cast<uint64_t>(op->getFunctionPtr()));
-	}
-	frame.setValue(op->getIdentifier(), reg);
-}
+// processIndirectCall and processFunctionAddressOf removed — see comment above processProxyCall.
 
 // ── Type conversion ───────────────────────────────────────────────────────────
 
