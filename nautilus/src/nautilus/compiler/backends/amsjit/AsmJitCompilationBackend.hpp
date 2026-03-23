@@ -6,7 +6,7 @@
 namespace nautilus::compiler::asmjit {
 
 /**
- * @brief Compilation backend that JIT-compiles IR to native machine code using AsmJit
+ * @brief Compilation backend that generates x86-64 machine code via AsmJit.
  */
 class AsmJitCompilationBackend : public CompilationBackend {
 public:

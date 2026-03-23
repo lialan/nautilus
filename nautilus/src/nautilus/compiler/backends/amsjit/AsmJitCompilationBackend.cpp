@@ -7,11 +7,12 @@
 #endif
 #include "nautilus/compiler/backends/amsjit/AsmJitExecutable.hpp"
 #include <memory>
+#include <sstream>
 
 namespace nautilus::compiler::asmjit {
 
 std::unique_ptr<Executable> AsmJitCompilationBackend::compile(const std::shared_ptr<ir::IRGraph>& ir,
-                                                              const DumpHandler& /*dumpHandler*/,
+                                                              const DumpHandler& dumpHandler,
                                                               const engine::Options& /*options*/) const {
 	auto runtime = std::make_unique<::asmjit::JitRuntime>();
 	AsmJitLoweringProvider provider;
@@ -20,6 +21,12 @@ std::unique_ptr<Executable> AsmJitCompilationBackend::compile(const std::shared_
 	if (!result.basePtr) {
 		return nullptr;
 	}
+
+	dumpHandler.dump("after_asmjit_generation", "asm", [&]() {
+		std::stringstream ss;
+		ss << "AsmJit compiled " << result.jitPtrs.size() << " functions";
+		return ss.str();
+	});
 
 	return std::make_unique<AsmJitExecutable>(std::move(runtime), result.basePtr, std::move(result.jitPtrs));
 }
