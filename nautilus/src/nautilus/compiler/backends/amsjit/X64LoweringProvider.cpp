@@ -151,13 +151,12 @@ void AsmJitLoweringProvider::LoweringContext::emitMove(const AsmReg& dst, const 
 //         and call cc.endFunc(). cc.finalize() resolves all label references.
 
 void AsmJitLoweringProvider::LoweringContext::processAll() {
-	const auto& functionOperations = ir->getFunctionOperations();
-	if (functionOperations.empty()) {
-		throw std::runtime_error("AsmJit: no functions found in IR graph");
-	}
+	// IRGraph exposes a single root FunctionOperation via getRootOperation().
+	// Wrap it in a local array so the two-pass loop below remains unchanged.
+	const ir::FunctionOperation* functionOperations[] = {&ir->getRootOperation()};
 
 	// Pass 1: register all functions and obtain stable labels.
-	for (const auto& funcOp : functionOperations) {
+	for (const auto* funcOp : functionOperations) {
 		const auto& funcBlock = funcOp->getFunctionBasicBlock();
 		const auto& entryArgs = funcBlock.getArguments();
 		FuncSignature sig;
@@ -170,7 +169,7 @@ void AsmJitLoweringProvider::LoweringContext::processAll() {
 	}
 
 	// Pass 2: emit each function body.
-	for (const auto& funcOp : functionOperations) {
+	for (const auto* funcOp : functionOperations) {
 		const auto& funcBlock = funcOp->getFunctionBasicBlock();
 		const auto& entryArgs = funcBlock.getArguments();
 		auto* funcNode = funcNodes_.at(funcOp->getName());
@@ -283,6 +282,23 @@ void AsmJitLoweringProvider::LoweringContext::processBlockInvocation(const ir::B
 
 void AsmJitLoweringProvider::LoweringContext::processOperation(const std::unique_ptr<ir::Operation>& op,
                                                                RegisterFrame& frame) {
+	// AllocaOp, IndirectCallOp, FunctionAddressOfOp are not in the OperationType
+	// enum in this version of the IR API. Dispatch them via dynamic_cast before
+	// the enum-based switch so the compiler does not see unknown enum values.
+	// op.get() returns a non-const pointer, so dynamic_cast yields a mutable ptr.
+	if (auto* allocaOp = dynamic_cast<ir::AllocaOperation*>(op.get())) {
+		processAlloca(allocaOp, frame);
+		return;
+	}
+	if (auto* indirectCallOp = dynamic_cast<ir::IndirectCallOperation*>(op.get())) {
+		processIndirectCall(indirectCallOp, frame);
+		return;
+	}
+	if (auto* fnAddrOp = dynamic_cast<ir::FunctionAddressOfOperation*>(op.get())) {
+		processFunctionAddressOf(fnAddrOp, frame);
+		return;
+	}
+
 	using OT = ir::Operation::OperationType;
 	switch (op->getOperationType()) {
 	case OT::ConstBooleanOp:
@@ -351,17 +367,8 @@ void AsmJitLoweringProvider::LoweringContext::processOperation(const std::unique
 	case OT::StoreOp:
 		processStore(as<ir::StoreOperation>(op), frame);
 		return;
-	case OT::AllocaOp:
-		processAlloca(as<ir::AllocaOperation>(op), frame);
-		return;
 	case OT::ProxyCallOp:
 		processProxyCall(as<ir::ProxyCallOperation>(op), frame);
-		return;
-	case OT::IndirectCallOp:
-		processIndirectCall(as<ir::IndirectCallOperation>(op), frame);
-		return;
-	case OT::FunctionAddressOfOp:
-		processFunctionAddressOf(as<ir::FunctionAddressOfOperation>(op), frame);
 		return;
 	case OT::CastOp:
 		processCast(as<ir::CastOperation>(op), frame);
